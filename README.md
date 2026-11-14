@@ -187,6 +187,35 @@ for chunk in stream:
 
 A system message replaces Claude Code's default system prompt. More examples are in `examples/`.
 
+### Request parameters
+
+`POST /v1/chat/completions` takes the OpenAI request body. Not every field has a Claude equivalent:
+
+| Parameter | Support | Notes |
+|-----------|---------|-------|
+| `model` | Yes | Any model from [Supported models](#supported-models); defaults to the server default |
+| `messages` | Yes | `system`, `user`, `assistant` and `tool` roles; text parts only, image parts are dropped |
+| `stream` | Yes | Text streams as the model writes it, also when `tools` are set |
+| `stream_options.include_usage` | Yes | Adds a final chunk with token usage |
+| `tools`, `tool_choice` | Yes | See [Function calling](#function-calling); `tool_choice` is an instruction to the model, not enforced |
+| `response_format` | Yes | `json_object` and `json_schema`, see [JSON response mode](#json-response-mode) |
+| `reasoning_effort` | Yes | `minimal` (sent as `low`), `low`, `medium`, `high`, `xhigh`, `max` |
+| `temperature`, `top_p` | Approximated | Turned into a system-prompt instruction; sampling itself is not changed |
+| `max_tokens`, `max_completion_tokens` | Ignored | The Agent SDK has no output cap; `WRAPPER_MAP_MAX_TOKENS_TO_THINKING=true` maps them to the thinking budget instead |
+| `presence_penalty`, `frequency_penalty`, `logit_bias`, `stop` | Ignored | Accepted; a warning is logged |
+| `user` | Ignored | Logged only |
+| `n` | `1` only | `n > 1` returns a validation error |
+
+Fields not listed (such as `seed`, `logprobs` or `parallel_tool_calls`) are dropped without a warning.
+
+The wrapper also reads these fields, which are not part of OpenAI's API. With the OpenAI SDKs, pass them in `extra_body`:
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `effort` | `low`, `medium`, `high`, `xhigh`, `max` | Effort level under Claude's name; wins over `reasoning_effort` |
+| `enable_tools` | boolean | Turn on Claude Code's built-in tools (Bash, Read, Edit, ...). Off by default |
+| `session_id` | string | Keep conversation context on the server, see [Sessions](#sessions) |
+
 ### Claude-specific headers
 
 | Header | Values | Description |
@@ -289,7 +318,7 @@ Sessions expire after 1 hour of inactivity. See `examples/session_continuity.py`
 
 ## Function calling
 
-Pass OpenAI-format tool definitions. The wrapper injects them into Claude's system prompt and parses the response back into `tool_calls`. Streamed tool calls carry an `index` and the stream ends with `finish_reason: "tool_calls"`.
+Pass OpenAI-format tool definitions. The wrapper injects them into Claude's system prompt and parses the response back into `tool_calls`. When streaming, text before a tool call streams as usual; the call itself is held back, sent as `tool_calls` deltas with an `index`, and the stream ends with `finish_reason: "tool_calls"`.
 
 ```python
 response = client.chat.completions.create(
@@ -403,9 +432,7 @@ Set `WRAPPER_QUOTA_ENFORCEMENT_ENABLED=true` to refuse requests before the round
 ## Limitations
 
 - Image parts in messages are dropped; only text reaches Claude.
-- `temperature` and `top_p` are applied through system-prompt instructions, which is a best-effort approximation.
-- `presence_penalty` and `frequency_penalty` are accepted but ignored.
-- `max_tokens` is ignored unless `WRAPPER_MAP_MAX_TOKENS_TO_THINKING=true`.
+- `temperature` and `top_p` are approximated, and `max_tokens`, the penalties, `logit_bias` and `stop` are ignored. See [Request parameters](#request-parameters).
 - Multiple responses (`n > 1`) are not supported.
 
 ## Testing
