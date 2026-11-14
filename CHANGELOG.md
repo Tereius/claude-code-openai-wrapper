@@ -12,8 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Streamed chat completions arrive as the model writes them. The SDK was
   run without partial messages, so each assistant turn was sent as one
   chunk once complete and clients such as Open WebUI showed the whole reply
-  at once. Text deltas are now forwarded; with client `tools` defined the
-  reply is still buffered, since tool calls are parsed from the full text.
+  at once. Text deltas are now forwarded. With client `tools` defined (Open
+  WebUI sends its tools with every request) text streams too, up to the
+  point where a tool call starts; that part is held back and parsed into
+  `tool_calls` at the end, so call markup never reaches the client as text.
 - Effort set in the request body is applied. `reasoning_effort` (OpenAI's
   name, `minimal` maps to `low`) and `effort` were silently dropped, so
   clients such as Open WebUI that cannot set `X-Claude-Effort` ran at the

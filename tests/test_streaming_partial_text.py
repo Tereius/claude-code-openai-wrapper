@@ -112,17 +112,65 @@ def test_subagent_deltas_are_not_forwarded(monkeypatch):
     assert _contents(chunks) == ["Answer."]
 
 
-def test_with_client_tools_the_complete_message_is_parsed(monkeypatch):
+def _tool_deltas(chunks):
+    return [tc for c in chunks for ch in c.choices for tc in (ch.delta.tool_calls or [])]
+
+
+def _finish(chunks):
+    return [ch.finish_reason for c in chunks for ch in c.choices if ch.finish_reason]
+
+
+def _split(text, size=3):
+    return [_delta(text[i : i + size]) for i in range(0, len(text), size)]
+
+
+def test_with_client_tools_a_split_tool_call_block_is_parsed(monkeypatch):
     text = '```tool_calls\n[{"name": "get_weather", "arguments": {"city": "Berlin"}}]\n```'
     chunks = _stream(
         monkeypatch,
-        [_delta(text[:10]), _delta(text[10:]), {"content": [{"type": "text", "text": text}]}],
+        [*_split(text), {"content": [{"type": "text", "text": text}]}],
         tools=TOOLS,
     )
 
-    tool_deltas = [tc for c in chunks for ch in c.choices for tc in (ch.delta.tool_calls or [])]
-    assert [tc.function.name for tc in tool_deltas] == ["get_weather"]
-    assert not any("tool_calls" in t for t in _contents(chunks))
+    assert [tc.function.name for tc in _tool_deltas(chunks)] == ["get_weather"]
+    assert not any("`" in t or "get_weather" in t for t in _contents(chunks))
+    assert _finish(chunks) == ["tool_calls"]
+
+
+def test_with_client_tools_plain_text_streams(monkeypatch):
+    text = "Berlin is sunny [mostly] and <b>warm</b>."
+    chunks = _stream(
+        monkeypatch,
+        [*_split(text), {"content": [{"type": "text", "text": text}]}],
+        tools=TOOLS,
+    )
+
+    contents = _contents(chunks)
+    assert len(contents) > 5
+    assert "".join(contents) == text
+    assert not _tool_deltas(chunks)
+    assert _finish(chunks) == ["stop"]
+
+
+def test_with_client_tools_text_before_a_call_streams_and_markup_is_held(monkeypatch):
+    text = (
+        "Let me check the weather.\n\n"
+        '<invoke name="get_weather">\n<parameter name="city">Berlin</parameter>\n</invoke>'
+    )
+    chunks = _stream(monkeypatch, _split(text), tools=TOOLS)
+
+    assert "".join(_contents(chunks)) == "Let me check the weather.\n\n"
+    assert [tc.function.name for tc in _tool_deltas(chunks)] == ["get_weather"]
+    assert _finish(chunks) == ["tool_calls"]
+
+
+def test_with_client_tools_markup_for_unknown_tool_is_sent_as_text(monkeypatch):
+    text = 'Try this:\n<invoke name="Bash">\n<parameter name="command">ls</parameter>\n</invoke>'
+    chunks = _stream(monkeypatch, _split(text), tools=TOOLS)
+
+    assert "".join(_contents(chunks)) == text
+    assert not _tool_deltas(chunks)
+    assert _finish(chunks) == ["stop"]
 
 
 def test_partial_messages_are_requested_only_when_streaming(monkeypatch):

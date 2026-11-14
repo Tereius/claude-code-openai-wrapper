@@ -126,6 +126,61 @@ def parse_tool_calls(response_text: str, tool_names=None) -> tuple[list, str]:
     return ([], response_text)
 
 
+# Where parse_tool_calls can find a call: a fenced tool_calls block, a bare
+# [{"name": ...}] array, or <invoke>/<function_calls> markup.
+_TOOL_CALL_START_RE = re.compile(
+    r'```tool_calls|\[\s*\{\s*"name"\s*:|<(?:\w+:)?(?:invoke|function_calls)[\s>]'
+)
+# Text at the end of what has arrived that may still grow into such a start.
+_PARTIAL_START_RES = (
+    re.compile(r"`{1,3}(?:t(?:o(?:o(?:l(?:_(?:c(?:a(?:l(?:l(?:s)?)?)?)?)?)?)?)?)?)?"),
+    re.compile(r'\[\s*(?:\{\s*(?:"[a-z]*(?:"\s*)?)?)?'),
+    re.compile(r"<[\w:]*"),
+)
+_PARTIAL_START_MAX = 32
+
+
+class ToolCallStreamGuard:
+    """Lets reply text stream while client tools are defined.
+
+    Text is passed on until a tool-call start shows up; from there on it is
+    held back, so the call markup never reaches the client as text, and
+    ``finish`` returns it for parse_tool_calls. A tail that may still turn
+    into a start is held until the next piece decides it.
+    """
+
+    def __init__(self) -> None:
+        self._pending = ""
+        self._holding = False
+
+    def feed(self, text: str) -> str:
+        self._pending += text
+        if self._holding:
+            return ""
+        match = _TOOL_CALL_START_RE.search(self._pending)
+        if match:
+            self._holding = True
+            return self._release(match.start())
+        return self._release(self._partial_start())
+
+    def finish(self) -> str:
+        """Everything held back, for parse_tool_calls."""
+        held, self._pending = self._pending, ""
+        return held
+
+    def _release(self, upto: int) -> str:
+        out, self._pending = self._pending[:upto], self._pending[upto:]
+        return out
+
+    def _partial_start(self) -> int:
+        tail_start = max(0, len(self._pending) - _PARTIAL_START_MAX)
+        for i in range(tail_start, len(self._pending)):
+            tail = self._pending[i:]
+            if any(p.fullmatch(tail) for p in _PARTIAL_START_RES):
+                return i
+        return len(self._pending)
+
+
 def format_tool_calls(parsed_calls: list) -> list:
     result = []
     for call in parsed_calls:

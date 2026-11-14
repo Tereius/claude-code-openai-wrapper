@@ -52,6 +52,7 @@ from src.function_calling import (
     parse_tool_calls,
     format_tool_calls,
     convert_tool_messages,
+    ToolCallStreamGuard,
 )
 from src.cpu_watchdog import cpu_watchdog
 from src.auth import (
@@ -1187,6 +1188,8 @@ async def generate_streaming_response(
         json_mode_buffer = []  # Buffer for JSON mode - accumulate all content
         tool_call_buffer = []  # Buffer when tools are defined - parse at end
         fence_stripper = JsonFenceStripper() if json_mode else None
+        # With client tools, text streams until a tool call starts.
+        tool_guard = ToolCallStreamGuard() if has_tools else None
         # Set once text deltas went out, so the complete AssistantMessage that
         # follows them is not sent a second time.
         partial_text_streamed = False
@@ -1198,14 +1201,14 @@ async def generate_streaming_response(
             **_run_completion_kwargs(claude_options, prompt, system_prompt, stream=True),
         ):
             if _is_stream_event(chunk):
-                # Tool calls are parsed from the whole reply, so with client
-                # tools the complete AssistantMessage is used instead.
-                text = None if has_tools else _stream_event_text(chunk)
+                text = _stream_event_text(chunk)
                 if text:
                     partial_text_streamed = True
-                    if json_mode and fence_stripper:
+                    if tool_guard:
+                        text = tool_guard.feed(text)
+                    elif json_mode and fence_stripper:
                         text = fence_stripper.process_delta(text)
-                    elif not content_sent:
+                    if text and not content_sent and (tool_guard or not json_mode):
                         text = text.lstrip()
                 if text:
                     if not role_sent:
@@ -1385,7 +1388,12 @@ async def generate_streaming_response(
                 yield f"data: {flush_chunk.model_dump_json()}\n\n"
                 content_sent = True
 
-        # Handle tool call buffer: parse and emit tool_calls
+        # Handle tool call buffer: parse and emit tool_calls. Text before a
+        # tool call has already streamed; only the held-back rest is parsed.
+        if tool_guard:
+            held = tool_guard.finish()
+            if held:
+                tool_call_buffer.insert(0, held)
         if has_tools and tool_call_buffer:
             combined = "".join(tool_call_buffer)
             parsed_calls, remaining_text = parse_tool_calls(combined, tool_names)
