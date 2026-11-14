@@ -677,3 +677,72 @@ class TestModelCatalogue:
             assert model_id not in MODEL_PRICING
             assert model_id not in MODEL_FALLBACK_MAP
             assert model_id not in MODEL_FALLBACK_MAP.values()
+
+
+class TestEffortFromBody:
+    """Effort level sent in the request body (Open WebUI and other OpenAI clients)."""
+
+    def _req(self, **kwargs):
+        return ChatCompletionRequest(messages=[Message(role="user", content="hi")], **kwargs)
+
+    def test_no_effort_by_default(self):
+        assert "effort" not in self._req().to_claude_options()
+
+    @pytest.mark.parametrize("level", ["low", "medium", "high", "xhigh", "max"])
+    def test_reasoning_effort_maps_to_effort(self, level):
+        assert self._req(reasoning_effort=level).to_claude_options()["effort"] == level
+
+    def test_effort_field_is_accepted(self):
+        assert self._req(effort="xhigh").to_claude_options()["effort"] == "xhigh"
+
+    def test_values_are_normalized(self):
+        assert self._req(reasoning_effort=" HIGH ").to_claude_options()["effort"] == "high"
+
+    def test_minimal_maps_to_low(self):
+        assert self._req(reasoning_effort="minimal").to_claude_options()["effort"] == "low"
+
+    def test_effort_wins_over_reasoning_effort(self):
+        options = self._req(effort="max", reasoning_effort="low").to_claude_options()
+        assert options["effort"] == "max"
+
+    def test_invalid_effort_falls_back_to_reasoning_effort(self):
+        options = self._req(effort="bogus", reasoning_effort="medium").to_claude_options()
+        assert options["effort"] == "medium"
+
+    def test_invalid_value_is_dropped_with_warning(self, caplog):
+        with caplog.at_level("WARNING", logger="src.models"):
+            options = self._req(reasoning_effort="ultra").to_claude_options()
+        assert "effort" not in options
+        assert "Invalid reasoning_effort='ultra'" in caplog.text
+
+    def test_header_overrides_body(self):
+        from src.main import _build_claude_options
+
+        request = self._req(effort="low")
+        options = _build_claude_options(request, {"effort": "xhigh"})
+        assert options["effort"] == "xhigh"
+
+    def test_body_effort_reaches_run_completion(self, monkeypatch):
+        """The Open WebUI payload shape ends up as effort= on the SDK call."""
+        import asyncio
+        from src import main as main_mod
+
+        seen = {}
+
+        async def fake_run_completion(**kwargs):
+            seen.update(kwargs)
+            yield {"subtype": "success", "is_error": False, "result": "ok"}
+
+        monkeypatch.setattr(main_mod.claude_cli, "run_completion", fake_run_completion)
+        request = ChatCompletionRequest(
+            model="claude-opus-5-5",
+            stream=True,
+            effort="xhigh",
+            messages=[Message(role="user", content="what is your effort level right now")],
+        )
+
+        async def drain():
+            return [c async for c in main_mod.generate_streaming_response(request, "req-effort")]
+
+        asyncio.run(drain())
+        assert seen["effort"] == "xhigh"

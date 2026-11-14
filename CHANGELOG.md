@@ -5,6 +5,16 @@ All notable changes to the Claude Code OpenAI Wrapper project will be documented
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Effort set in the request body is applied. `reasoning_effort` (OpenAI's
+  name, `minimal` maps to `low`) and `effort` were silently dropped, so
+  clients such as Open WebUI that cannot set `X-Claude-Effort` ran at the
+  default effort. `X-Claude-Effort` still overrides the body; invalid values
+  are logged and ignored.
+
 ## [2.14.0] - 2026-11-10
 
 ### Added

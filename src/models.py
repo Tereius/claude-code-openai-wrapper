@@ -5,6 +5,8 @@ from datetime import datetime
 import uuid
 import logging
 
+from src.constants import VALID_EFFORT_LEVELS
+
 logger = logging.getLogger(__name__)
 
 
@@ -163,6 +165,14 @@ class ChatCompletionRequest(BaseModel):
         default=None,
         description="Controls which function is called: 'none', 'auto', 'required', or specific function",
     )
+    reasoning_effort: Optional[str] = Field(
+        default=None,
+        description="Effort level (OpenAI name): minimal, low, medium, high, xhigh, max",
+    )
+    effort: Optional[str] = Field(
+        default=None,
+        description="Effort level (Claude name): low, medium, high, xhigh, max",
+    )
 
     @field_validator("n")
     @classmethod
@@ -262,6 +272,28 @@ class ChatCompletionRequest(BaseModel):
 
         return " ".join(instructions) if instructions else None
 
+    def _resolve_effort(self) -> Optional[str]:
+        """Effort level from the body: ``effort`` wins over ``reasoning_effort``.
+
+        OpenAI's ``minimal`` has no Claude equivalent and maps to ``low``.
+        Invalid values are logged and dropped. The X-Claude-Effort header,
+        merged after these options, overrides both.
+        """
+        for field_name in ("effort", "reasoning_effort"):
+            raw = getattr(self, field_name)
+            if raw is None:
+                continue
+            value = str(raw).lower().strip()
+            if value == "minimal":
+                value = "low"
+            if value in VALID_EFFORT_LEVELS:
+                return value
+            logger.warning(
+                f"Invalid {field_name}='{raw}' ignored. "
+                f"Valid values: {sorted(VALID_EFFORT_LEVELS | {'minimal'})}"
+            )
+        return None
+
     def to_claude_options(self) -> Dict[str, Any]:
         """Convert OpenAI request parameters to Claude Code SDK options."""
         # Log parameter handling information
@@ -287,6 +319,10 @@ class ChatCompletionRequest(BaseModel):
                 f"Mapped max_tokens={max_token_value} to max_thinking_tokens "
                 "(legacy behavior; WRAPPER_MAP_MAX_TOKENS_TO_THINKING=true)"
             )
+
+        effort = self._resolve_effort()
+        if effort:
+            options["effort"] = effort
 
         # Use user field for session identification if provided
         if self.user:

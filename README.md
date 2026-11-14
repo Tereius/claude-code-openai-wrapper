@@ -199,6 +199,8 @@ A system message replaces Claude Code's default system prompt. More examples are
 | `X-Claude-Max-Thinking-Tokens` | integer | Thinking token budget |
 | `X-Enable-Cache` | `true` / `1` / `yes` | Opt in to the response cache for this request |
 
+Effort can also go in the request body as `reasoning_effort` (OpenAI's name; `minimal` maps to `low`) or `effort`. This is what Open WebUI sends from Chat Controls → Advanced Params, so no custom header is needed there. If both body fields are set, `effort` wins; `X-Claude-Effort` overrides the body. Invalid values are logged and ignored.
+
 ## Supported models
 
 Model IDs, context windows and pricing come from the Anthropic models docs (`platform.claude.com/docs/en/models/overview`, pricing page) and are mirrored in `src/constants.py`.
