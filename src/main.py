@@ -52,6 +52,7 @@ from src.function_calling import (
     parse_tool_calls,
     format_tool_calls,
     convert_tool_messages,
+    ToolCallStreamGuard,
 )
 from src.cpu_watchdog import cpu_watchdog
 from src.auth import (
@@ -1078,6 +1079,28 @@ def _run_completion_kwargs(
     }
 
 
+def _is_stream_event(chunk: Any) -> bool:
+    """True for a converted SDK StreamEvent (a raw Anthropic API stream event)."""
+    return isinstance(chunk, dict) and isinstance(chunk.get("event"), dict) and "uuid" in chunk
+
+
+def _stream_event_text(chunk: Dict[str, Any]) -> Optional[str]:
+    """The text of a main-agent text_delta StreamEvent, else None.
+
+    Subagent events (parent_tool_use_id set) are left out; their text still
+    arrives through the complete AssistantMessage, as before.
+    """
+    if chunk.get("parent_tool_use_id"):
+        return None
+    event = chunk["event"]
+    if event.get("type") != "content_block_delta":
+        return None
+    delta = event.get("delta")
+    if not isinstance(delta, dict) or delta.get("type") != "text_delta":
+        return None
+    return delta.get("text") or None
+
+
 async def generate_streaming_response(
     request: ChatCompletionRequest, request_id: str, claude_headers: Optional[Dict[str, Any]] = None
 ) -> AsyncGenerator[str, None]:
@@ -1165,6 +1188,11 @@ async def generate_streaming_response(
         json_mode_buffer = []  # Buffer for JSON mode - accumulate all content
         tool_call_buffer = []  # Buffer when tools are defined - parse at end
         fence_stripper = JsonFenceStripper() if json_mode else None
+        # With client tools, text streams until a tool call starts.
+        tool_guard = ToolCallStreamGuard() if has_tools else None
+        # Set once text deltas went out, so the complete AssistantMessage that
+        # follows them is not sent a second time.
+        partial_text_streamed = False
 
         if has_tools and json_mode:
             logger.info("Both tools and JSON mode active -- tools take priority for buffering")
@@ -1172,6 +1200,42 @@ async def generate_streaming_response(
         async for chunk in claude_cli.run_completion(
             **_run_completion_kwargs(claude_options, prompt, system_prompt, stream=True),
         ):
+            if _is_stream_event(chunk):
+                text = _stream_event_text(chunk)
+                if text:
+                    partial_text_streamed = True
+                    if tool_guard:
+                        text = tool_guard.feed(text)
+                    elif json_mode and fence_stripper:
+                        text = fence_stripper.process_delta(text)
+                    if text and not content_sent and (tool_guard or not json_mode):
+                        text = text.lstrip()
+                if text:
+                    if not role_sent:
+                        initial_chunk = ChatCompletionStreamResponse(
+                            id=request_id,
+                            model=request.model,
+                            choices=[
+                                StreamChoice(
+                                    index=0,
+                                    delta={"role": "assistant", "content": ""},
+                                    finish_reason=None,
+                                )
+                            ],
+                        )
+                        yield f"data: {initial_chunk.model_dump_json()}\n\n"
+                        role_sent = True
+                    stream_chunk = ChatCompletionStreamResponse(
+                        id=request_id,
+                        model=request.model,
+                        choices=[
+                            StreamChoice(index=0, delta={"content": text}, finish_reason=None)
+                        ],
+                    )
+                    yield f"data: {stream_chunk.model_dump_json()}\n\n"
+                    content_sent = True
+                continue
+
             chunks_buffer.append(chunk)
 
             # Check if we have an assistant message
@@ -1186,7 +1250,10 @@ async def generate_streaming_response(
                 # New format: {"content": [TextBlock(...)]}  (converted AssistantMessage)
                 content = chunk["content"]
 
-            if content is not None:
+            if content is not None and partial_text_streamed:
+                # Its text already went out as deltas.
+                partial_text_streamed = False
+            elif content is not None:
                 # Send initial role chunk if we haven't already
                 if not role_sent:
                     initial_chunk = ChatCompletionStreamResponse(
@@ -1321,7 +1388,12 @@ async def generate_streaming_response(
                 yield f"data: {flush_chunk.model_dump_json()}\n\n"
                 content_sent = True
 
-        # Handle tool call buffer: parse and emit tool_calls
+        # Handle tool call buffer: parse and emit tool_calls. Text before a
+        # tool call has already streamed; only the held-back rest is parsed.
+        if tool_guard:
+            held = tool_guard.finish()
+            if held:
+                tool_call_buffer.insert(0, held)
         if has_tools and tool_call_buffer:
             combined = "".join(tool_call_buffer)
             parsed_calls, remaining_text = parse_tool_calls(combined, tool_names)

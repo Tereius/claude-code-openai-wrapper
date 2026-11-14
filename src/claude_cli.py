@@ -280,6 +280,12 @@ class ClaudeCodeCLI:
                 options = ClaudeAgentOptions(max_turns=max_turns, cwd=self.cwd)
                 options.stderr = _stderr_capture
 
+                # Without partial messages the SDK yields each assistant turn
+                # only once it is complete, so a "streamed" reply reached the
+                # client in one piece. The StreamEvents carry the text deltas.
+                if stream:
+                    options.include_partial_messages = True
+
                 # Set model if specified
                 if model:
                     options.model = model
