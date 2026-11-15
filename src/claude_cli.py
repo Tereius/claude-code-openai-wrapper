@@ -198,6 +198,11 @@ class ClaudeCodeCLI:
         The stream is drained rather than broken at the first assistant turn
         so the terminating result frame, and any RateLimitEvent alongside it,
         are seen.
+
+        The probe runs every few minutes, so it sends the smallest request
+        that still reaches the API: no tools, settings or MCP servers, and a
+        one-line system prompt. With the claude_code preset and the user's
+        settings it sent about 17K tokens each time.
         """
         logger.info("Testing Claude Agent SDK...")
 
@@ -207,7 +212,10 @@ class ClaudeCodeCLI:
             options=ClaudeAgentOptions(
                 max_turns=1,
                 cwd=self.cwd,
-                system_prompt={"type": "preset", "preset": "claude_code"},
+                system_prompt="Reply with one word.",
+                tools=[],
+                setting_sources=[],
+                strict_mcp_config=True,
             ),
         ):
             messages.append(message)
@@ -250,8 +258,15 @@ class ClaudeCodeCLI:
         permission_mode: Optional[str] = None,
         effort: Optional[str] = None,
         thinking: Optional[str] = None,
+        fork_session: bool = False,
+        fallback_prompt: Optional[str] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        """Run Claude Agent using the Python SDK and yield response chunks."""
+        """Run Claude Agent using the Python SDK and yield response chunks.
+
+        With ``session_id`` the CLI resumes that session (as a fork of it when
+        ``fork_session`` is set). If the session no longer exists, the query
+        runs once more as a new session with ``fallback_prompt``.
+        """
 
         try:
             # Set authentication environment variables (if any)
@@ -307,6 +322,11 @@ class ClaudeCodeCLI:
                     if not allowed_tools and set(CLAUDE_TOOLS) <= set(disallowed_tools):
                         options.tools = []
                         options.setting_sources = []
+                        # claude.ai connectors still load otherwise. They
+                        # connect in the background, so whether their tools
+                        # precede the messages varies per request, which
+                        # breaks the prompt cache.
+                        options.strict_mcp_config = True
 
                 # Set permission mode (needed for tool execution in API context)
                 if permission_mode:
@@ -323,6 +343,7 @@ class ClaudeCodeCLI:
                     options.continue_session = True
                 elif session_id:
                     options.resume = session_id
+                    options.fork_session = fork_session
 
                 # Run the query with retry logic
                 retry_state = RetryState()
@@ -388,6 +409,23 @@ class ClaudeCodeCLI:
 
                     except Exception as query_error:
                         error_str = str(query_error)
+
+                        # The session file can be gone, e.g. after the CLI's
+                        # transcript cleanup. Start a new session instead.
+                        if (
+                            options.resume
+                            and fallback_prompt is not None
+                            and "No conversation found with session ID" in error_str
+                        ):
+                            logger.warning(
+                                f"Resume of session {options.resume} failed; "
+                                "sending the full conversation instead"
+                            )
+                            options.resume = None
+                            options.fork_session = False
+                            prompt = fallback_prompt
+                            continue
+
                         status_code = getattr(
                             query_error,
                             "status_code",
@@ -627,6 +665,7 @@ class ClaudeCodeCLI:
             "duration_ms": 0,
             "num_turns": 0,
             "model": None,
+            "usage": None,
         }
 
         for message in messages:
@@ -638,6 +677,7 @@ class ClaudeCodeCLI:
                         "duration_ms": message.get("duration_ms", 0),
                         "num_turns": message.get("num_turns", 0),
                         "session_id": message.get("session_id"),
+                        "usage": message.get("usage"),
                     }
                 )
             # New SDK format - SystemMessage
@@ -652,6 +692,7 @@ class ClaudeCodeCLI:
                         "duration_ms": message.get("duration_ms", 0),
                         "num_turns": message.get("num_turns", 0),
                         "session_id": message.get("session_id"),
+                        "usage": message.get("usage"),
                     }
                 )
             elif message.get("type") == "system" and message.get("subtype") == "init":

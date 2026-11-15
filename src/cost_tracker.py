@@ -42,6 +42,18 @@ class UsageRecord:
     cache_creation_tokens: int = 0
     web_search_requests: int = 0
 
+    @classmethod
+    def from_sdk(cls, usage: Dict[str, Any]) -> "UsageRecord":
+        """Build from the usage dict of the SDK's ResultMessage."""
+        server_tool_use = usage.get("server_tool_use") or {}
+        return cls(
+            input_tokens=usage.get("input_tokens") or 0,
+            output_tokens=usage.get("output_tokens") or 0,
+            cache_read_tokens=usage.get("cache_read_input_tokens") or 0,
+            cache_creation_tokens=usage.get("cache_creation_input_tokens") or 0,
+            web_search_requests=server_tool_use.get("web_search_requests") or 0,
+        )
+
 
 @dataclass
 class SessionCost:

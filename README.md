@@ -97,7 +97,10 @@ If `API_KEY` is unset, the server asks at startup whether to generate one. That 
 | `ANTHROPIC_MODELS_URL` | Live models endpoint | `https://api.anthropic.com/v1/models` |
 | `ANTHROPIC_VERSION` | `anthropic-version` header sent to the Models API | `2023-06-01` |
 | `ANTHROPIC_BETA` / `ANTHROPIC_BETA_HEADER` | Optional `anthropic-beta` header sent to the Models API (added to the OAuth beta flag when a subscription token is used) | - |
-| `CLI_AUTH_PROBE_INTERVAL_SECONDS` | Seconds between background CLI auth probes under `cli` auth. Each probe is a real 1-turn query. Only an `auth_failure` result makes requests return 401. `0` disables. | `600` (10 min) |
+| `CONVERSATION_RESUME` | Resume the CLI session behind a conversation so its history comes from the prompt cache (see [Sessions](#sessions)) | `true` |
+| `CONVERSATION_RESUME_MAX_ENTRIES` | Conversations remembered for resuming | `1000` |
+| `CONVERSATION_RESUME_TTL_HOURS` | How long a conversation stays resumable | `24` |
+| `CLI_AUTH_PROBE_INTERVAL_SECONDS` | Seconds between background CLI auth probes under `cli` auth. Each probe is a real 1-turn query of about 550 tokens. Only an `auth_failure` result makes requests return 401. `0` disables. | `600` (10 min) |
 | `WRAPPER_QUOTA_ENFORCEMENT_ENABLED` | Refuse requests with 429 while a quota window is `rejected` | `false` |
 | `WRAPPER_QUOTA_PROBE_EVERY_N_REQUESTS` | Requests between quota refresh probes. A probe is a real 1-turn call that spends quota. `0` relies on live traffic alone. | `100` |
 | `WRAPPER_QUOTA_PROBE_MIN_INTERVAL_SECONDS` | Minimum seconds between quota probes | `300` (5 min) |
@@ -196,7 +199,7 @@ A system message replaces Claude Code's default system prompt. More examples are
 | `model` | Yes | Any model from [Supported models](#supported-models); defaults to the server default |
 | `messages` | Yes | `system`, `user`, `assistant` and `tool` roles; text parts only, image parts are dropped |
 | `stream` | Yes | Text streams as the model writes it, also when `tools` are set |
-| `stream_options.include_usage` | Yes | Adds a final chunk with token usage |
+| `stream_options.include_usage` | Yes | Adds a final chunk with token usage as measured by the CLI; `prompt_tokens_details.cached_tokens` shows the part read from the prompt cache |
 | `tools`, `tool_choice` | Yes | See [Function calling](#function-calling); `tool_choice` is an instruction to the model, not enforced |
 | `response_format` | Yes | `json_object` and `json_schema`, see [JSON response mode](#json-response-mode) |
 | `reasoning_effort` | Yes | `minimal` (sent as `low`), `low`, `medium`, `high`, `xhigh`, `max` |
@@ -290,6 +293,24 @@ response2 = client.chat.completions.create(
 ```
 
 Sessions expire after 1 hour of inactivity. See `examples/session_continuity.py` and `examples/session_curl_example.sh`.
+
+### Prompt caching across turns
+
+Clients that resend the whole conversation each turn, as most OpenAI clients
+do, need no `session_id` for the history to be cached. After each reply the
+wrapper remembers which Claude CLI session produced it. When the next request
+contains the same messages and that reply followed by new user or tool
+messages, the wrapper resumes that session and sends only the new messages,
+so the history is read from the prompt cache instead of being written to it
+again. The session is forked, so a regenerated or edited turn starts its own
+branch.
+
+A request that changes earlier messages, or whose reply the wrapper did not
+produce, runs as a new session with the full conversation. The index is in
+memory per worker process, so with several `UVICORN_WORKERS` a turn handled
+by another worker starts a new session, and a restart forgets all
+conversations. Set `CONVERSATION_RESUME=false` to always send the full
+conversation.
 
 ## API endpoints
 

@@ -9,6 +9,7 @@ import time
 import uuid
 from typing import Optional, AsyncGenerator, Dict, Any, List
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 
 from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.security import HTTPAuthorizationCredentials
@@ -24,11 +25,14 @@ from src.models import (
     ChatCompletionResponse,
     ChatCompletionStreamResponse,
     Choice,
+    FunctionCall,
     Message,
+    PromptTokensDetails,
     ResponseFormat,
     Usage,
     StreamChoice,
     SessionListResponse,
+    ToolCall,
     ToolListResponse,
     ToolMetadataResponse,
     ToolConfigurationResponse,
@@ -44,6 +48,7 @@ from src.models import (
     AnthropicUsage,
 )
 from src.claude_cli import ClaudeCodeCLI, ClaudeResultError
+from src.conversation_index import conversation_index
 from src.circuit_breaker import sdk_circuit_breaker
 from src.message_adapter import MessageAdapter, JsonFenceStripper
 from src.function_calling import (
@@ -369,9 +374,9 @@ async def lifespan(app: FastAPI):
     # Periodic CLI auth probe. Only runs when auth_method == claude_cli because
     # API key / Bedrock / Vertex failures already surface as
     # assistant_authentication_failed via _ASSISTANT_ERROR_STATUS. Set the
-    # interval to 0 to disable. Each probe is a 1-turn query and costs ~$0.001
-    # at Sonnet pricing; default 10 min keeps the bill low while still bounding
-    # the stale window.
+    # interval to 0 to disable. Each probe is a 1-turn query of about 550
+    # tokens; default 10 min keeps the bill low while still bounding the
+    # stale window.
     async def cli_auth_probe_loop():
         interval = int(os.getenv("CLI_AUTH_PROBE_INTERVAL_SECONDS", "600"))
         if interval <= 0:
@@ -914,11 +919,167 @@ def _wants_json(response_format: Optional[ResponseFormat]) -> bool:
     return bool(response_format and response_format.type in ("json_object", "json_schema"))
 
 
+@dataclass
+class PreparedPrompt:
+    prompt: str
+    system_prompt: Optional[str]
+    json_mode: bool
+    has_tools: bool
+    tool_names: set
+
+
+def _prepare_prompt(
+    request: ChatCompletionRequest,
+    messages: List[Message],
+    conversation_prompt: Optional[str] = None,
+    log_label: str = "",
+) -> PreparedPrompt:
+    """Build the CLI prompt and system prompt for a chat completion request.
+
+    ``conversation_prompt`` replaces the flattened conversation, for a resumed
+    session that only needs the new messages. The system prompt still comes
+    from all of ``messages``.
+    """
+    # Convert tool role messages for Claude compatibility
+    if request.tools:
+        messages = convert_tool_messages(messages)
+
+    # Convert messages to prompt
+    prompt, system_prompt = MessageAdapter.messages_to_prompt(messages)
+    if conversation_prompt is not None:
+        prompt = conversation_prompt
+
+    # In JSON mode the caller's system prompt carries the output contract,
+    # which the Agent SDK ignores in the system slot. Relocate before the
+    # sampling and tool blocks so those still reach the system prompt.
+    if _wants_json(request.response_format) and system_prompt:
+        prompt, system_prompt = MessageAdapter.relocate_system_contract(prompt, system_prompt)
+        logger.info(f"JSON mode{log_label}: relocated caller system prompt into user turn")
+
+    # Add sampling instructions from temperature/top_p if present
+    sampling_instructions = request.get_sampling_instructions()
+    if sampling_instructions:
+        if system_prompt:
+            system_prompt = f"{system_prompt}\n\n{sampling_instructions}"
+        else:
+            system_prompt = sampling_instructions
+        logger.debug(f"Added sampling instructions: {sampling_instructions}")
+
+    # Function calling: inject tool definitions into system prompt
+    has_tools = bool(request.tools)
+    tool_names: set = set()
+    if has_tools:
+        tools_dicts = [t.model_dump() for t in request.tools]
+        tool_names = {t.get("function", {}).get("name") for t in tools_dicts}
+        tools_prompt = build_tools_system_prompt(tools_dicts, request.tool_choice)
+        if tools_prompt:
+            if system_prompt:
+                system_prompt = f"{system_prompt}\n\n{tools_prompt}"
+            else:
+                system_prompt = tools_prompt
+            logger.info(
+                f"Function calling{log_label}: injected {len(request.tools)} tool definitions"
+            )
+
+    # Check for JSON mode
+    json_mode = _wants_json(request.response_format)
+    if json_mode:
+        if request.response_format.type == "json_schema" and request.response_format.json_schema:
+            # JSON schema mode: inject schema into prompt (not system_prompt)
+            schema = request.response_format.json_schema
+            schema_json = json.dumps(schema.schema_ or {}, indent=2)
+            schema_instructions = MessageAdapter.JSON_SCHEMA_TEMPLATE.format(
+                schema_json=schema_json
+            )
+            prompt = f"{schema_instructions}\n\n{prompt}"
+            logger.info(
+                f"JSON schema mode{log_label}: injected schema ({len(schema_json)} chars) into prompt"
+            )
+        else:
+            # Basic JSON object mode
+            if system_prompt:
+                system_prompt = f"{MessageAdapter.JSON_MODE_INSTRUCTION}\n\n{system_prompt}"
+            else:
+                system_prompt = MessageAdapter.JSON_MODE_INSTRUCTION
+            prompt = prompt + MessageAdapter.JSON_PROMPT_SUFFIX
+            logger.info(
+                f"JSON mode enabled{log_label} - instruction added to system and user prompt"
+            )
+
+    # Filter content for unsupported features
+    prompt = MessageAdapter.filter_content(prompt)
+    if system_prompt:
+        system_prompt = MessageAdapter.filter_content(system_prompt)
+
+    return PreparedPrompt(prompt, system_prompt, json_mode, has_tools, tool_names)
+
+
+def _plan_resume(
+    request: ChatCompletionRequest, messages: List[Message], prepared: PreparedPrompt
+) -> tuple[str, Dict[str, Any]]:
+    """Return the prompt to send and the run_completion resume arguments.
+
+    When the CLI session that produced the last reply is known, only the
+    messages after that reply are sent; the session supplies the history
+    from the prompt cache. Otherwise the full prompt goes out unchanged.
+    """
+    plan = conversation_index.lookup(messages)
+    if plan is None:
+        return prepared.prompt, {}
+
+    new_messages = convert_tool_messages(plan.new_messages) if request.tools else plan.new_messages
+    new_text = "\n\n".join(m.content for m in new_messages if m.role == "user" and m.content)
+    if not new_text:
+        return prepared.prompt, {}
+
+    resumed = _prepare_prompt(request, messages, conversation_prompt=new_text)
+    logger.info(
+        f"Resuming CLI session {plan.session_id} with {len(plan.new_messages)} new message(s)"
+    )
+    return resumed.prompt, {
+        "session_id": plan.session_id,
+        "fork_session": True,
+        "fallback_prompt": prepared.prompt,
+    }
+
+
+def _token_usage(chunks: List[Any], prompt: str, completion: str) -> UsageRecord:
+    """Token usage the CLI reported for the query.
+
+    Falls back to a character-count estimate when the result carries no
+    usage. The estimate misses the system prompt and everything the CLI adds
+    to the prompt, so it is far too low.
+    """
+    usage = claude_cli.extract_metadata(chunks).get("usage")
+    if isinstance(usage, dict) and usage:
+        return UsageRecord.from_sdk(usage)
+    return UsageRecord(
+        input_tokens=MessageAdapter.estimate_tokens(prompt),
+        output_tokens=MessageAdapter.estimate_tokens(completion),
+    )
+
+
+def _openai_usage(record: UsageRecord) -> Usage:
+    """OpenAI counts cached tokens as part of prompt_tokens."""
+    prompt_tokens = record.input_tokens + record.cache_read_tokens + record.cache_creation_tokens
+    return Usage(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=record.output_tokens,
+        total_tokens=prompt_tokens + record.output_tokens,
+        prompt_tokens_details=PromptTokensDetails(cached_tokens=record.cache_read_tokens),
+    )
+
+
 def _run_completion_kwargs(
-    claude_options: Dict[str, Any], prompt: str, system_prompt: Optional[str], stream: bool
+    claude_options: Dict[str, Any],
+    prompt: str,
+    system_prompt: Optional[str],
+    stream: bool,
+    resume_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Extract run_completion keyword arguments from claude_options."""
     return {
+        **(resume_kwargs or {}),
         "prompt": prompt,
         "system_prompt": system_prompt,
         "model": claude_options.get("model"),
@@ -954,83 +1115,84 @@ def _stream_event_text(chunk: Dict[str, Any]) -> Optional[str]:
     return delta.get("text") or None
 
 
+def _collect_streamed_reply(sse: str, reply: Dict[str, Any]) -> None:
+    """Accumulate the reply a client assembles from one SSE event."""
+    if not sse.startswith("data: ") or sse.startswith("data: [DONE]"):
+        return
+    try:
+        event = json.loads(sse[len("data: ") :])
+    except ValueError:
+        return
+    if "error" in event:
+        reply["failed"] = True
+        return
+    for choice in event.get("choices") or []:
+        delta = choice.get("delta") or {}
+        if delta.get("content"):
+            reply["content"].append(delta["content"])
+        for tc in delta.get("tool_calls") or []:
+            call = reply["tool_calls"].setdefault(
+                tc.get("index", 0), {"id": "", "name": "", "arguments": ""}
+            )
+            function = tc.get("function") or {}
+            call["id"] = tc.get("id") or call["id"]
+            call["name"] += function.get("name") or ""
+            call["arguments"] += function.get("arguments") or ""
+        if choice.get("finish_reason"):
+            reply["finish_reason"] = choice["finish_reason"]
+
+
 async def generate_streaming_response(
     request: ChatCompletionRequest, request_id: str, claude_headers: Optional[Dict[str, Any]] = None
 ) -> AsyncGenerator[str, None]:
-    """Generate SSE formatted streaming response."""
+    """Generate SSE formatted streaming response.
+
+    Records the reply as the client received it, so the next turn of the
+    conversation can resume the CLI session that produced it.
+    """
+    resume_state: Dict[str, Any] = {}
+    reply: Dict[str, Any] = {"content": [], "tool_calls": {}, "finish_reason": None}
+    async for sse in _stream_completion_events(request, request_id, claude_headers, resume_state):
+        _collect_streamed_reply(sse, reply)
+        yield sse
+
+    if reply.get("failed") or reply["finish_reason"] not in ("stop", "tool_calls"):
+        return
+    tool_calls = [
+        ToolCall(id=c["id"], function=FunctionCall(name=c["name"], arguments=c["arguments"]))
+        for _, c in sorted(reply["tool_calls"].items())
+    ]
+    conversation_index.record(
+        resume_state.get("messages", []),
+        Message(
+            role="assistant",
+            content="".join(reply["content"]) or None,
+            tool_calls=tool_calls or None,
+        ),
+        resume_state.get("session_id"),
+    )
+
+
+async def _stream_completion_events(
+    request: ChatCompletionRequest,
+    request_id: str,
+    claude_headers: Optional[Dict[str, Any]],
+    resume_state: Dict[str, Any],
+) -> AsyncGenerator[str, None]:
     try:
         # Process messages with session management
         all_messages, actual_session_id = session_manager.process_messages(
             request.messages, request.session_id
         )
+        resume_state["messages"] = all_messages
 
-        # Convert tool role messages for Claude compatibility
-        if request.tools:
-            all_messages = convert_tool_messages(all_messages)
-
-        # Convert messages to prompt
-        prompt, system_prompt = MessageAdapter.messages_to_prompt(all_messages)
-
-        # In JSON mode the caller's system prompt carries the output contract,
-        # which the Agent SDK ignores in the system slot. Relocate before the
-        # sampling and tool blocks so those still reach the system prompt.
-        if _wants_json(request.response_format) and system_prompt:
-            prompt, system_prompt = MessageAdapter.relocate_system_contract(prompt, system_prompt)
-            logger.info("JSON mode (streaming): relocated caller system prompt into user turn")
-
-        # Add sampling instructions from temperature/top_p if present
-        sampling_instructions = request.get_sampling_instructions()
-        if sampling_instructions:
-            if system_prompt:
-                system_prompt = f"{system_prompt}\n\n{sampling_instructions}"
-            else:
-                system_prompt = sampling_instructions
-            logger.debug(f"Added sampling instructions: {sampling_instructions}")
-
-        # Function calling: inject tool definitions into system prompt
-        has_tools = request.tools and len(request.tools) > 0
+        prepared = _prepare_prompt(request, all_messages, log_label=" (streaming)")
+        system_prompt = prepared.system_prompt
+        json_mode = prepared.json_mode
+        has_tools = prepared.has_tools
+        tool_names = prepared.tool_names
         tool_calls_emitted = False
-        if has_tools:
-            tools_dicts = [t.model_dump() for t in request.tools]
-            tool_names = {t.get("function", {}).get("name") for t in tools_dicts}
-            tools_prompt = build_tools_system_prompt(tools_dicts, request.tool_choice)
-            if tools_prompt:
-                if system_prompt:
-                    system_prompt = f"{system_prompt}\n\n{tools_prompt}"
-                else:
-                    system_prompt = tools_prompt
-                logger.info(
-                    f"Function calling (streaming): injected {len(request.tools)} tool definitions"
-                )
-
-        # Check for JSON mode
-        json_mode = _wants_json(request.response_format)
-        if json_mode:
-            if (
-                request.response_format.type == "json_schema"
-                and request.response_format.json_schema
-            ):
-                schema = request.response_format.json_schema
-                schema_json = json.dumps(schema.schema_ or {}, indent=2)
-                schema_instructions = MessageAdapter.JSON_SCHEMA_TEMPLATE.format(
-                    schema_json=schema_json
-                )
-                prompt = f"{schema_instructions}\n\n{prompt}"
-                logger.info(f"JSON schema mode (streaming): injected schema into prompt")
-            else:
-                if system_prompt:
-                    system_prompt = f"{MessageAdapter.JSON_MODE_INSTRUCTION}\n\n{system_prompt}"
-                else:
-                    system_prompt = MessageAdapter.JSON_MODE_INSTRUCTION
-                prompt = prompt + MessageAdapter.JSON_PROMPT_SUFFIX
-                logger.info(
-                    "JSON mode enabled (streaming) - instruction added to system and user prompt"
-                )
-
-        # Filter content for unsupported features
-        prompt = MessageAdapter.filter_content(prompt)
-        if system_prompt:
-            system_prompt = MessageAdapter.filter_content(system_prompt)
+        prompt, resume_kwargs = _plan_resume(request, all_messages, prepared)
 
         claude_options = _build_claude_options(request, claude_headers)
 
@@ -1051,7 +1213,9 @@ async def generate_streaming_response(
             logger.info("Both tools and JSON mode active -- tools take priority for buffering")
 
         async for chunk in claude_cli.run_completion(
-            **_run_completion_kwargs(claude_options, prompt, system_prompt, stream=True),
+            **_run_completion_kwargs(
+                claude_options, prompt, system_prompt, stream=True, resume_kwargs=resume_kwargs
+            ),
         ):
             if _is_stream_event(chunk):
                 text = _stream_event_text(chunk)
@@ -1438,27 +1602,19 @@ async def generate_streaming_response(
                 yield "data: [DONE]\n\n"
             return
 
+        resume_state["session_id"] = claude_cli.extract_metadata(chunks_buffer).get("session_id")
+
+        token_usage = _token_usage(chunks_buffer, prompt, assistant_content or "")
+        await cost_tracker.record_usage(
+            session_id=actual_session_id or request_id,
+            model=request.model,
+            usage=token_usage,
+        )
+
         # Prepare usage data if requested
         usage_data = None
         if request.stream_options and request.stream_options.include_usage:
-            # Estimate token usage based on prompt and completion
-            completion_text = assistant_content or ""
-            token_usage = claude_cli.estimate_token_usage(prompt, completion_text, request.model)
-            usage_data = Usage(
-                prompt_tokens=token_usage["prompt_tokens"],
-                completion_tokens=token_usage["completion_tokens"],
-                total_tokens=token_usage["total_tokens"],
-            )
-            logger.debug(f"Estimated usage: {usage_data}")
-
-            await cost_tracker.record_usage(
-                session_id=actual_session_id or request_id,
-                model=request.model,
-                usage=UsageRecord(
-                    input_tokens=token_usage["prompt_tokens"],
-                    output_tokens=token_usage["completion_tokens"],
-                ),
-            )
+            usage_data = _openai_usage(token_usage)
 
         # Send final chunk with finish reason and optionally usage data
         final_chunk = ChatCompletionStreamResponse(
@@ -1670,84 +1826,25 @@ async def chat_completions(
                 f"Chat completion: session_id={actual_session_id}, total_messages={len(all_messages)}"
             )
 
-            # Convert tool role messages for Claude compatibility
-            if request_body.tools:
-                all_messages = convert_tool_messages(all_messages)
-
-            # Convert messages to prompt
-            prompt, system_prompt = MessageAdapter.messages_to_prompt(all_messages)
-
-            # In JSON mode the caller's system prompt carries the output
-            # contract, which the Agent SDK ignores in the system slot.
-            # Relocate before the sampling and tool blocks so those still
-            # reach the system prompt.
-            if _wants_json(request_body.response_format) and system_prompt:
-                prompt, system_prompt = MessageAdapter.relocate_system_contract(
-                    prompt, system_prompt
-                )
-                logger.info("JSON mode: relocated caller system prompt into user turn")
-
-            # Add sampling instructions from temperature/top_p if present
-            sampling_instructions = request_body.get_sampling_instructions()
-            if sampling_instructions:
-                if system_prompt:
-                    system_prompt = f"{system_prompt}\n\n{sampling_instructions}"
-                else:
-                    system_prompt = sampling_instructions
-                logger.debug(f"Added sampling instructions: {sampling_instructions}")
-
-            # Function calling: inject tool definitions into system prompt
-            has_tools = request_body.tools and len(request_body.tools) > 0
-            if has_tools:
-                tools_dicts = [t.model_dump() for t in request_body.tools]
-                tool_names = {t.get("function", {}).get("name") for t in tools_dicts}
-                tools_prompt = build_tools_system_prompt(tools_dicts, request_body.tool_choice)
-                if tools_prompt:
-                    if system_prompt:
-                        system_prompt = f"{system_prompt}\n\n{tools_prompt}"
-                    else:
-                        system_prompt = tools_prompt
-                    logger.info(
-                        f"Function calling: injected {len(request_body.tools)} tool definitions"
-                    )
-
-            # Check for JSON mode
-            json_mode = _wants_json(request_body.response_format)
-            if json_mode:
-                if (
-                    request_body.response_format.type == "json_schema"
-                    and request_body.response_format.json_schema
-                ):
-                    # JSON schema mode: inject schema into prompt (not system_prompt)
-                    schema = request_body.response_format.json_schema
-                    schema_json = json.dumps(schema.schema_ or {}, indent=2)
-                    schema_instructions = MessageAdapter.JSON_SCHEMA_TEMPLATE.format(
-                        schema_json=schema_json
-                    )
-                    prompt = f"{schema_instructions}\n\n{prompt}"
-                    logger.info(
-                        f"JSON schema mode: injected schema ({len(schema_json)} chars) into prompt"
-                    )
-                else:
-                    # Basic JSON object mode
-                    if system_prompt:
-                        system_prompt = f"{MessageAdapter.JSON_MODE_INSTRUCTION}\n\n{system_prompt}"
-                    else:
-                        system_prompt = MessageAdapter.JSON_MODE_INSTRUCTION
-                    prompt = prompt + MessageAdapter.JSON_PROMPT_SUFFIX
-                    logger.info("JSON mode enabled - instruction added to system and user prompt")
-
-            # Filter content
-            prompt = MessageAdapter.filter_content(prompt)
-            if system_prompt:
-                system_prompt = MessageAdapter.filter_content(system_prompt)
+            prepared = _prepare_prompt(request_body, all_messages)
+            system_prompt = prepared.system_prompt
+            json_mode = prepared.json_mode
+            has_tools = prepared.has_tools
+            tool_names = prepared.tool_names
+            prompt, resume_kwargs = _plan_resume(request_body, all_messages, prepared)
 
             claude_options = _build_claude_options(request_body, claude_headers)
 
             # Collect all chunks
             chunks = []
             async for chunk in claude_cli.run_completion(
-                **_run_completion_kwargs(claude_options, prompt, system_prompt, stream=False),
+                **_run_completion_kwargs(
+                    claude_options,
+                    prompt,
+                    system_prompt,
+                    stream=False,
+                    resume_kwargs=resume_kwargs,
+                ),
             ):
                 chunks.append(chunk)
 
@@ -1815,17 +1912,15 @@ async def chat_completions(
                 )
                 session_manager.add_assistant_response(actual_session_id, assistant_message)
 
-            # Estimate tokens (rough approximation)
-            prompt_tokens = MessageAdapter.estimate_tokens(prompt)
-            completion_tokens = MessageAdapter.estimate_tokens(assistant_content or "")
+            token_usage = _token_usage(chunks, prompt, assistant_content or "")
+            usage = _openai_usage(token_usage)
+            prompt_tokens = usage.prompt_tokens
+            completion_tokens = usage.completion_tokens
 
             await cost_tracker.record_usage(
                 session_id=actual_session_id or request_id,
                 model=request_body.model,
-                usage=UsageRecord(
-                    input_tokens=prompt_tokens,
-                    output_tokens=completion_tokens,
-                ),
+                usage=token_usage,
             )
 
             # Create response
@@ -1844,11 +1939,7 @@ async def chat_completions(
                         finish_reason=finish_reason,
                     )
                 ],
-                usage=Usage(
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    total_tokens=prompt_tokens + completion_tokens,
-                ),
+                usage=usage,
             )
 
             # Store in cache if enabled
@@ -1862,6 +1953,7 @@ async def chat_completions(
             # triage a single `| json | subtype=...` query instead of grepping
             # DEBUG for num_turns and friends.
             metadata = claude_cli.extract_metadata(chunks)
+            conversation_index.record(all_messages, response_message, metadata.get("session_id"))
             logger.info(
                 _kv(
                     "completion_result",
@@ -2030,9 +2122,7 @@ async def anthropic_messages(
         # Filter out tool usage and thinking blocks
         assistant_content = MessageAdapter.filter_content(raw_assistant_content)
 
-        # Estimate tokens
-        prompt_tokens = MessageAdapter.estimate_tokens(prompt)
-        completion_tokens = MessageAdapter.estimate_tokens(assistant_content)
+        token_usage = _token_usage(chunks, prompt, assistant_content)
 
         # Create Anthropic-format response
         response = AnthropicMessagesResponse(
@@ -2040,8 +2130,10 @@ async def anthropic_messages(
             content=[AnthropicTextBlock(text=assistant_content)],
             stop_reason="end_turn",
             usage=AnthropicUsage(
-                input_tokens=prompt_tokens,
-                output_tokens=completion_tokens,
+                input_tokens=token_usage.input_tokens,
+                output_tokens=token_usage.output_tokens,
+                cache_creation_input_tokens=token_usage.cache_creation_tokens,
+                cache_read_input_tokens=token_usage.cache_read_tokens,
             ),
         )
 

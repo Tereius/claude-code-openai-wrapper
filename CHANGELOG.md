@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Multi-turn chat reads its history from the prompt cache. Each request
+  flattened the whole conversation into one prompt for a new CLI session;
+  that prompt changed every turn, so the cache never matched it and every
+  turn paid to write the full history to the cache again. The wrapper now
+  remembers which CLI session produced each reply and, when a request
+  continues that conversation, resumes the session (forked, so regenerated
+  and edited turns branch off) and sends only the new messages. Measured on
+  a 6K-token conversation: the second turn wrote 336 tokens to the cache
+  instead of 12K. Requests that do not continue a known reply, and resumes
+  whose session file is gone, send the full conversation as before.
+  `CONVERSATION_RESUME=false` turns this off.
 - Live model discovery with a claude.ai subscription. Under `cli` auth,
   `CLAUDE_CODE_OAUTH_TOKEN` is sent to the Anthropic Models API as a Bearer
   token, so `/v1/models`, `/v1/models/refresh` and the latest-Sonnet default
@@ -27,6 +38,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Responses report the token usage the CLI measured. `usage` was estimated
+  at four characters per token from the prompt text, which left out the
+  system prompt and everything the CLI adds: a request that sent 23K tokens
+  reported 6.5K. Chat completions now include cached tokens in
+  `prompt_tokens` and report them in `prompt_tokens_details.cached_tokens`;
+  `/v1/messages` reports `cache_creation_input_tokens` and
+  `cache_read_input_tokens`. Cost tracking uses the same numbers, so cache
+  reads and writes are priced at their own rates, and streamed requests are
+  tracked without `stream_options.include_usage` too. The estimate remains as
+  a fallback when the CLI reports no usage.
+- The CLI auth probe, which also refreshes quota readings, sends about 550
+  tokens instead of about 17,700. It ran with the `claude_code` preset, the
+  user's settings and MCP servers every 10 minutes; it now uses a one-line
+  system prompt and no tools, settings or MCP servers.
+- Plain chat (tools off) no longer loads MCP servers from the user's
+  settings or claude.ai connectors. Their tools were sent with every request
+  despite all tools being disabled, about 11K tokens each with one claude.ai
+  connector, and because connectors attach in the background, whether they
+  were included changed from request to request and broke the prompt cache.
 - Streamed chat completions arrive as the model writes them. The SDK was
   run without partial messages, so each assistant turn was sent as one
   chunk once complete and clients such as Open WebUI showed the whole reply
