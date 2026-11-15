@@ -29,6 +29,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `docker-compose.yml` no longer mounts the host's `~/.claude`. The
+  container authenticates with `CLAUDE_CODE_OAUTH_TOKEN` (from
+  `claude setup-token`, read from `.env`) and keeps the CLI's state in its
+  own `/root/.claude`. With the mount, the wrapper's sessions landed in the
+  host user's Claude Code history, and since each resumed turn forks the
+  session, every turn added another copy of the conversation there. The
+  mount is still in the file, commented out.
 - Model discovery has one implementation, in `ModelService`. `/v1/models`
   and request validation used separate fetchers and caches and could
   disagree; `/v1/models/status` could report `fallback` while `/v1/models`

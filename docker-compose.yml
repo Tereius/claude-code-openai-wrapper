@@ -12,12 +12,18 @@ services:
     container_name: claude-wrapper
     ports:
       - "8000:8000"
-    volumes:
-      # Mount Claude CLI credentials. :Z relabels for SELinux (Fedora, RHEL,
-      # rootless Podman) and is ignored where SELinux is not enforcing.
-      - ~/.claude:/root/.claude:Z
-      # Optional: Mount a specific workspace directory
-      # - ./workspace:/workspace
+    # The CLI keeps its config and session transcripts in /root/.claude
+    # inside the container, and authenticates with CLAUDE_CODE_OAUTH_TOKEN
+    # (below). Recreating the container clears the transcripts.
+    #
+    # Mounting the host's ~/.claude instead reuses its login, but the
+    # wrapper's sessions then land in your own Claude Code history: every
+    # resumed turn writes a copy of the conversation there. :Z relabels for
+    # SELinux (Fedora, RHEL, rootless Podman).
+    # volumes:
+    #   - ~/.claude:/root/.claude:Z
+    #   # Optional: Mount a specific workspace directory
+    #   - ./workspace:/workspace
     environment:
       - PORT=8000
       - MAX_TIMEOUT=600000
@@ -35,8 +41,9 @@ services:
       # - ANTHROPIC_API_KEY=your-api-key
       # Option 2: Explicit auth method selection
       # - CLAUDE_AUTH_METHOD=cli  # Options: cli, api_key, bedrock, vertex
-      # Option 3: Subscription OAuth token, read by the bundled CLI and
-      # passed through from the host. Empty when the host has none.
+      # Option 3: Subscription OAuth token, read by the bundled CLI. Create
+      # it with `claude setup-token` and put it in .env next to this file.
+      # Required unless you use another option or mount ~/.claude above.
       - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:-}
       # Optional: Set Claude's working directory (defaults to isolated temp dir)
       # - CLAUDE_CWD=/workspace

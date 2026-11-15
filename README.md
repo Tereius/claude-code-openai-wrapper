@@ -45,15 +45,18 @@ The server listens on `http://localhost:8000`. Point your OpenAI client there.
 Pre-built image on Docker Hub: `ttlequals0/claude-code-openai-wrapper`.
 
 ```bash
+# Create a subscription token once (valid for a year)
+claude setup-token
+
 # Pull and run
 docker run -d -p 8000:8000 \
-  -v ~/.claude:/root/.claude \
+  -e CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-... \
   --name claude-wrapper \
   ttlequals0/claude-code-openai-wrapper:latest
 
 # Pin to a specific version
 docker run -d -p 8000:8000 \
-  -v ~/.claude:/root/.claude \
+  -e CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-... \
   --name claude-wrapper \
   ttlequals0/claude-code-openai-wrapper:2.14.0
 
@@ -61,7 +64,9 @@ docker run -d -p 8000:8000 \
 docker build --platform linux/amd64 -t claude-wrapper:local .
 ```
 
-For Docker Compose, use the `docker-compose.yml` in the repo: `docker compose up -d`.
+For Docker Compose, put `CLAUDE_CODE_OAUTH_TOKEN=...` in a `.env` file next to the repo's `docker-compose.yml` and run `docker compose up -d`.
+
+The container keeps the CLI's config and session transcripts in its own `/root/.claude`, so they are cleared when the container is recreated. You can mount the host's `~/.claude` instead (`-v ~/.claude:/root/.claude`) to reuse its login, but the wrapper's sessions then show up in your own Claude Code history, and each resumed conversation turn (see [Prompt caching across turns](#prompt-caching-across-turns)) writes another copy of the conversation there.
 
 ## Configuration
 
