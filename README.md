@@ -104,7 +104,7 @@ If `API_KEY` is unset, the server asks at startup whether to generate one. That 
 | `ANTHROPIC_BETA` / `ANTHROPIC_BETA_HEADER` | Optional `anthropic-beta` header sent to the Models API (added to the OAuth beta flag when a subscription token is used) | - |
 | `CONVERSATION_RESUME` | Resume the CLI session behind a conversation so its history comes from the prompt cache (see [Sessions](#sessions)) | `true` |
 | `CONVERSATION_RESUME_MAX_ENTRIES` | Conversations remembered for resuming | `1000` |
-| `CONVERSATION_RESUME_TTL_HOURS` | How long a conversation stays resumable | `24` |
+| `CONVERSATION_RESUME_TTL_HOURS` | How long a conversation stays resumable. Session transcripts of the wrapper's workspaces older than this are deleted hourly. | `24` |
 | `CLI_AUTH_PROBE_INTERVAL_SECONDS` | Seconds between background CLI auth probes under `cli` auth. Each probe is a real 1-turn query of about 550 tokens. Only an `auth_failure` result makes requests return 401. `0` disables. | `600` (10 min) |
 | `WRAPPER_QUOTA_ENFORCEMENT_ENABLED` | Refuse requests with 429 while a quota window is `rejected` | `false` |
 | `WRAPPER_QUOTA_PROBE_EVERY_N_REQUESTS` | Requests between quota refresh probes. A probe is a real 1-turn call that spends quota. `0` relies on live traffic alone. | `100` |
@@ -316,6 +316,17 @@ memory per worker process, so with several `UVICORN_WORKERS` a turn handled
 by another worker starts a new session, and a restart forgets all
 conversations. Set `CONVERSATION_RESUME=false` to always send the full
 conversation.
+
+Resuming needs the CLI's session transcripts, which it writes under
+`~/.claude/projects` (or `$CLAUDE_CONFIG_DIR/projects`). The CLI's own
+retention cleanup (`cleanupPeriodDays`) does not run for sessions started
+through the SDK, so the wrapper deletes them itself: once an hour, every
+transcript older than `CONVERSATION_RESUME_TTL_HOURS` in the directories of
+its temporary workspaces, including those left by earlier runs. Transcripts
+of a `CLAUDE_CWD` directory or any other project are never touched. Requests
+that are never resumed write no transcript: the auth and quota probes,
+`/v1/messages`, `/healthz/deep`, and every request when
+`CONVERSATION_RESUME=false`.
 
 ## API endpoints
 

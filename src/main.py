@@ -281,6 +281,10 @@ def _log_build_info() -> None:
         logger.warning(f"Build info unavailable: {e}")
 
 
+# How often expired session transcripts are deleted.
+TRANSCRIPT_PRUNE_INTERVAL_SECONDS = 3600
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Verify Claude Code authentication and CLI on startup."""
@@ -417,6 +421,24 @@ async def lifespan(app: FastAPI):
 
     quota_probe_task = asyncio.get_running_loop().create_task(quota_probe_loop())
 
+    # Session transcripts are kept so a conversation's next turn can resume
+    # its CLI session. Once the resume index has forgotten a session, its
+    # transcript is dead weight; the CLI's own retention cleanup does not
+    # run for SDK sessions.
+    async def transcript_prune_loop():
+        try:
+            while True:
+                removed = await asyncio.to_thread(
+                    claude_cli.prune_transcripts, conversation_index.ttl_seconds
+                )
+                if removed:
+                    logger.info(f"Pruned {removed} expired session transcript(s)")
+                await asyncio.sleep(TRANSCRIPT_PRUNE_INTERVAL_SECONDS)
+        except asyncio.CancelledError:
+            pass
+
+    transcript_prune_task = asyncio.get_running_loop().create_task(transcript_prune_loop())
+
     # Start CPU watchdog (Linux/Docker only)
     cpu_watchdog.start()
 
@@ -426,6 +448,7 @@ async def lifespan(app: FastAPI):
     cost_cleanup_task.cancel()
     cli_auth_probe_task.cancel()
     quota_probe_task.cancel()
+    transcript_prune_task.cancel()
 
     # Cleanup on shutdown
     logger.info("Shutting down session manager...")
@@ -1080,6 +1103,8 @@ def _run_completion_kwargs(
     """Extract run_completion keyword arguments from claude_options."""
     return {
         **(resume_kwargs or {}),
+        # A transcript is only needed to resume the session later.
+        "persist_session": conversation_index.enabled,
         "prompt": prompt,
         "system_prompt": system_prompt,
         "model": claude_options.get("model"),
@@ -2042,6 +2067,7 @@ async def anthropic_messages(
             allowed_tools=DEFAULT_ALLOWED_TOOLS,
             permission_mode="bypassPermissions",
             stream=False,
+            persist_session=False,
         ):
             chunks.append(chunk)
 
@@ -2261,6 +2287,7 @@ async def healthz_deep(request: Request):
             stream=False,
             max_turns=DEFAULT_MAX_TURNS_NO_TOOLS,
             disallowed_tools=CLAUDE_TOOLS,
+            persist_session=False,
         ):
             chunks.append(chunk)
 

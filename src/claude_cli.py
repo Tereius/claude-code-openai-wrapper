@@ -1,4 +1,5 @@
 import os
+import re
 import tempfile
 import atexit
 import shutil
@@ -47,6 +48,23 @@ _ASSISTANT_ERROR_VALUES = frozenset(
         "unknown",
     }
 )
+
+
+# Prefix of the temporary workspaces this wrapper creates when CLAUDE_CWD is
+# unset; it names their transcript directories too.
+_WORKSPACE_PREFIX = "claude_code_workspace_"
+
+# CLI flag that stops the session transcript from being written.
+_NO_SESSION_PERSISTENCE = {"no-session-persistence": None}
+
+
+def _transcript_dir_name(path: str) -> str:
+    """Name of the directory under ~/.claude/projects the CLI uses for ``path``."""
+    return re.sub(r"[^a-zA-Z0-9]", "-", os.path.realpath(path))
+
+
+def _claude_config_dir() -> Path:
+    return Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
 
 
 def _extract_text_blocks(content: List[Any]) -> List[str]:
@@ -166,7 +184,7 @@ class ClaudeCodeCLI:
                 logger.info(f"Using CLAUDE_CWD: {self.cwd}")
         else:
             # Create isolated temp directory (cross-platform)
-            self.temp_dir = tempfile.mkdtemp(prefix="claude_code_workspace_")
+            self.temp_dir = tempfile.mkdtemp(prefix=_WORKSPACE_PREFIX)
             self.cwd = Path(self.temp_dir)
             logger.info(f"Using temporary isolated workspace: {self.cwd}")
 
@@ -216,6 +234,8 @@ class ClaudeCodeCLI:
                 tools=[],
                 setting_sources=[],
                 strict_mcp_config=True,
+                # Nothing ever resumes a probe.
+                extra_args=dict(_NO_SESSION_PERSISTENCE),
             ),
         ):
             messages.append(message)
@@ -260,12 +280,15 @@ class ClaudeCodeCLI:
         thinking: Optional[str] = None,
         fork_session: bool = False,
         fallback_prompt: Optional[str] = None,
+        persist_session: bool = True,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Run Claude Agent using the Python SDK and yield response chunks.
 
         With ``session_id`` the CLI resumes that session (as a fork of it when
         ``fork_session`` is set). If the session no longer exists, the query
-        runs once more as a new session with ``fallback_prompt``.
+        runs once more as a new session with ``fallback_prompt``. Without
+        ``persist_session`` the CLI writes no transcript, so the session
+        cannot be resumed later.
         """
 
         try:
@@ -294,6 +317,8 @@ class ClaudeCodeCLI:
                 # Build SDK options
                 options = ClaudeAgentOptions(max_turns=max_turns, cwd=self.cwd)
                 options.stderr = _stderr_capture
+                if not persist_session:
+                    options.extra_args.update(_NO_SESSION_PERSISTENCE)
 
                 # Without partial messages the SDK yields each assistant turn
                 # only once it is complete, so a "streamed" reply reached the
@@ -720,6 +745,42 @@ class ClaudeCodeCLI:
             "completion_tokens": completion_tokens,
             "total_tokens": prompt_tokens + completion_tokens,
         }
+
+    def prune_transcripts(self, max_age_seconds: float) -> int:
+        """Delete session transcripts of wrapper workspaces older than the limit.
+
+        The CLI keeps a transcript per session so it can be resumed, and its
+        own retention cleanup does not run for SDK sessions, so without this
+        they pile up. Only directories of the temporary workspaces this
+        wrapper creates are touched, including those of earlier runs, never
+        the transcripts of CLAUDE_CWD or any other project. Workspace
+        directories of earlier runs are removed once they hold no
+        transcripts. Returns the number of transcripts deleted.
+        """
+        projects = _claude_config_dir() / "projects"
+        prefix = _transcript_dir_name(os.path.join(tempfile.gettempdir(), _WORKSPACE_PREFIX))
+        current = _transcript_dir_name(str(self.cwd))
+        cutoff = time.time() - max_age_seconds
+        removed = 0
+
+        for project in projects.glob(prefix + "*"):
+            if not project.is_dir():
+                continue
+            for transcript in project.glob("*.jsonl"):
+                try:
+                    if transcript.stat().st_mtime >= cutoff:
+                        continue
+                    transcript.unlink()
+                except OSError as e:
+                    logger.debug(f"Could not prune transcript {transcript}: {e}")
+                    continue
+                # Subagent transcripts and tool results of that session.
+                shutil.rmtree(project / transcript.stem, ignore_errors=True)
+                removed += 1
+            if project.name != current and not any(project.glob("*.jsonl")):
+                shutil.rmtree(project, ignore_errors=True)
+
+        return removed
 
     def _cleanup_temp_dir(self):
         """Clean up temporary directory on exit."""

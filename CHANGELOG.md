@@ -45,6 +45,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Session transcripts no longer pile up. The CLI writes one per session and
+  its own retention cleanup does not run for SDK sessions; with resumed
+  conversations forking a session per turn, a few hours of chat left tens of
+  megabytes. The wrapper now deletes transcripts older than
+  `CONVERSATION_RESUME_TTL_HOURS` from its temporary workspaces (also those
+  of earlier runs) once an hour, and requests that are never resumed write
+  none: the auth and quota probes, `/v1/messages`, `/healthz/deep`, and all
+  requests with `CONVERSATION_RESUME=false`. Transcripts of `CLAUDE_CWD` or
+  other projects are not touched.
 - Responses report the token usage the CLI measured. `usage` was estimated
   at four characters per token from the prompt text, which left out the
   system prompt and everything the CLI adds: a request that sent 23K tokens
