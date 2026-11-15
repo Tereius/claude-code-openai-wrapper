@@ -92,31 +92,41 @@ class ConversationIndex:
         self._lock = Lock()
 
     def lookup(self, messages: List[Message]) -> Optional[ResumePlan]:
-        """Plan a resume when only user or tool messages follow the last reply."""
-        if not self.enabled:
+        """Plan a resume from the latest recorded reply in ``messages``.
+
+        The messages after that reply become the new turn. Besides user and
+        tool messages they may hold assistant messages the wrapper did not
+        produce: Open WebUI runs some tools itself and inserts the call and
+        its result before forwarding the user's turn.
+        """
+        if not self.enabled or not messages or messages[-1].role not in ("user", "tool"):
             return None
-        last_assistant = max(
-            (i for i, m in enumerate(messages) if m.role == "assistant"), default=None
-        )
-        if last_assistant is None:
-            return None
-        new_messages = messages[last_assistant + 1 :]
-        if not new_messages or any(m.role not in ("user", "tool") for m in new_messages):
+        assistant_positions = [i for i, m in enumerate(messages) if m.role == "assistant"]
+        if not assistant_positions:
             return None
 
-        history = messages[: last_assistant + 1]
-        key = conversation_key(history)
+        for position in reversed(assistant_positions):
+            new_messages = messages[position + 1 :]
+            if any(m.role == "system" for m in new_messages):
+                break
+            entry = self._get(conversation_key(messages[: position + 1]))
+            if entry is not None:
+                return ResumePlan(session_id=entry, new_messages=new_messages)
+
+        logger.info(f"No CLI session to resume for [{describe(messages)}]")
+        return None
+
+    def _get(self, key: str) -> Optional[str]:
         with self._lock:
             entry = self._entries.get(key)
-            if entry is not None and time.monotonic() - entry[1] > self.ttl_seconds:
+            if entry is None:
+                return None
+            session_id, stored_at = entry
+            if time.monotonic() - stored_at > self.ttl_seconds:
                 del self._entries[key]
-                entry = None
-            if entry is not None:
-                self._entries.move_to_end(key)
-        if entry is None:
-            logger.info(f"No CLI session to resume for [{describe(history)}]")
-            return None
-        return ResumePlan(session_id=entry[0], new_messages=new_messages)
+                return None
+            self._entries.move_to_end(key)
+            return session_id
 
     def record(self, messages: List[Message], reply: Message, session_id: Optional[str]) -> None:
         """Remember the session that produced ``reply`` to ``messages``."""

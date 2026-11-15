@@ -304,11 +304,19 @@ Sessions expire after 1 hour of inactivity. See `examples/session_continuity.py`
 Clients that resend the whole conversation each turn, as most OpenAI clients
 do, need no `session_id` for the history to be cached. After each reply the
 wrapper remembers which Claude CLI session produced it. When the next request
-contains the same messages and that reply followed by new user or tool
-messages, the wrapper resumes that session and sends only the new messages,
+contains the same messages and that reply followed by new messages, the
+wrapper resumes that session and sends only the new messages,
 so the history is read from the prompt cache instead of being written to it
 again. The session is forked, so a regenerated or edited turn starts its own
-branch.
+branch. The new messages may include tool calls the client ran itself, as Open
+WebUI does with some tools before it forwards a turn; they are sent along in
+the `Human:`/`Assistant:` form the full prompt uses.
+
+The log shows each decision: `Resuming CLI session …` when a turn is resumed,
+and otherwise `No CLI session to resume for [...]`. That line and the
+`Recorded CLI session … for [...]` line logged after each reply list every
+message as `role:hash/length`, so comparing them shows which message the
+client changed between turns.
 
 A request that changes earlier messages, or whose reply the wrapper did not
 produce, runs as a new session with the full conversation. The index is in

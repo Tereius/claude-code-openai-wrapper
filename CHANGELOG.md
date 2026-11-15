@@ -19,6 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a 6K-token conversation: the second turn wrote 336 tokens to the cache
   instead of 12K. Requests that do not continue a known reply, and resumes
   whose session file is gone, send the full conversation as before.
+  Tool calls the client ran itself and inserted after the reply (Open WebUI
+  does this) are sent along with the new turn. The log shows for each turn
+  whether it was resumed, and if not, a fingerprint per message to compare
+  with the one recorded after the previous reply.
   `CONVERSATION_RESUME=false` turns this off.
 - Live model discovery with a claude.ai subscription. Under `cli` auth,
   `CLAUDE_CODE_OAUTH_TOKEN` is sent to the Anthropic Models API as a Bearer

@@ -1051,7 +1051,12 @@ def _plan_resume(
         return prepared.prompt, {}
 
     new_messages = convert_tool_messages(plan.new_messages) if request.tools else plan.new_messages
-    new_text = "\n\n".join(m.content for m in new_messages if m.role == "user" and m.content)
+    if any(m.role == "assistant" for m in new_messages):
+        # Tool calls the client ran itself: keep who said what, in the
+        # format the full prompt uses.
+        new_text, _ = MessageAdapter.messages_to_prompt(new_messages)
+    else:
+        new_text = "\n\n".join(m.content for m in new_messages if m.role == "user" and m.content)
     if not new_text:
         return prepared.prompt, {}
 

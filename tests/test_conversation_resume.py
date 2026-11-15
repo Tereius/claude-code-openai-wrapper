@@ -75,6 +75,36 @@ class TestConversationIndex:
         assert index.lookup([_user("Hi"), _assistant("Hello!")]) is None
         assert index.lookup([_user("Hi")]) is None
 
+    def test_tool_calls_the_client_ran_itself_follow_the_recorded_reply(self):
+        """Open WebUI runs some tools itself and inserts call and result."""
+        index = ConversationIndex()
+        client_call = _assistant(tool_calls=[_call("c1", "get_time", "{}")])
+        first = [_user("Write a poem"), client_call, Message(role="tool", content="20:53")]
+        index.record(first, _assistant("Roses..."), "cli-1")
+
+        second_call = _assistant(tool_calls=[_call("c2", "get_time", "{}")])
+        new = [_user("Another one"), second_call, Message(role="tool", content="20:54")]
+        plan = index.lookup(first + [_assistant("Roses...")] + new)
+
+        assert plan.session_id == "cli-1"
+        assert plan.new_messages == new
+
+    def test_unrecorded_reply_is_resent_after_the_latest_recorded_one(self):
+        index = ConversationIndex()
+        index.record([_user("a")], _assistant("A"), "cli-1")
+
+        tail = [_user("b"), _assistant("B, never recorded"), _user("c")]
+        plan = index.lookup([_user("a"), _assistant("A")] + tail)
+
+        assert plan.session_id == "cli-1"
+        assert plan.new_messages == tail
+
+    def test_no_resume_when_the_last_message_is_a_reply(self):
+        index = ConversationIndex()
+        index.record([_user("a")], _assistant("A"), "cli-1")
+
+        assert index.lookup([_user("a"), _assistant("A"), _user("b"), _assistant("B")]) is None
+
     def test_log_shows_which_message_the_client_changed(self, caplog):
         index = ConversationIndex()
         with caplog.at_level("INFO", logger="src.conversation_index"):
@@ -174,6 +204,30 @@ def test_streaming_tool_call_turn_resumes_with_the_tool_result(monkeypatch, fres
 
     assert calls[1]["session_id"] == "cli-1"
     assert calls[1]["prompt"] == f"[Result of get_weather ({call_id}): sunny]"
+
+
+def test_streaming_turn_after_a_client_run_tool_sends_call_and_result(monkeypatch, fresh_index):
+    calls = _fake_sdk(monkeypatch, [("cli-1", "Roses are red."), ("cli-2", "Violets...")])
+
+    def client_tool(call_id, result):
+        return [
+            _assistant(tool_calls=[_call(call_id, "get_weather", '{"city": "Oslo"}')]),
+            Message(role="tool", content=result, tool_call_id=call_id, name="get_weather"),
+        ]
+
+    first = [_user("Write a poem")] + client_tool("c1", "sunny")
+    _stream(first, tools=TOOLS)
+    _stream(
+        first + [_assistant("Roses are red."), _user("Another one")] + client_tool("c2", "rainy"),
+        tools=TOOLS,
+    )
+
+    assert calls[1]["session_id"] == "cli-1"
+    assert calls[1]["prompt"] == (
+        "Human: Another one\n\n"
+        'Assistant: [Called get_weather with arguments: {"city": "Oslo"}]\n\n'
+        "Human: [Result of get_weather (c2): rainy]"
+    )
 
 
 def test_streaming_error_reply_is_not_recorded(monkeypatch, fresh_index):
