@@ -2,572 +2,485 @@
 """
 Unit tests for src/model_service.py
 
-Tests the ModelService class that fetches models from Anthropic API
-with graceful fallback to static constants. Includes tests for
-different authentication methods (anthropic, cli, bedrock, vertex).
+ModelService owns live model discovery: credential selection per auth method
+(API key or claude.ai OAuth token), the paginated Models API fetch, the TTL
+cache with stale-on-error behaviour, and the refresh/status endpoints.
+HTTP is served by httpx.MockTransport, so nothing touches the network.
 """
 
+import asyncio
 import time
-import pytest
-from unittest.mock import patch, AsyncMock, MagicMock, PropertyMock
+from types import SimpleNamespace
+
 import httpx
+import pytest
 
-from src.model_service import ModelService, MODEL_FETCH_TIMEOUT
-from src.constants import CLAUDE_MODELS
+from src import constants
+from src.model_service import OAUTH_BETA_HEADER, ModelService
+
+MODELS_URL = "https://api.anthropic.com/v1/models"
 
 
-class TestModelService:
-    """Test ModelService class."""
+def _model(model_id, created_at="2026-01-01T00:00:00Z"):
+    return {"type": "model", "id": model_id, "display_name": model_id, "created_at": created_at}
 
-    @pytest.fixture
-    def model_service(self):
-        """Create a fresh ModelService instance for each test."""
-        return ModelService()
+
+def _page(*ids, has_more=False):
+    return {
+        "data": [_model(i) for i in ids],
+        "has_more": has_more,
+        "first_id": ids[0] if ids else None,
+        "last_id": ids[-1] if ids else None,
+    }
+
+
+@pytest.fixture
+def env(monkeypatch):
+    """Start every test with no discovery credentials and no override.
+
+    main.py calls load_dotenv(), so a developer's real .env could otherwise
+    leak ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN into the test process.
+    """
+    for name in (
+        "ANTHROPIC_API_KEY",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "CLAUDE_MODELS_OVERRIDE",
+        "ANTHROPIC_BETA",
+        "ANTHROPIC_BETA_HEADER",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(constants, "ANTHROPIC_MODELS_URL", MODELS_URL)
+    monkeypatch.setattr(constants, "MODEL_LIST_CACHE_TTL_SECONDS", 3600)
+    monkeypatch.setattr(constants, "MODEL_LIST_ERROR_TTL_SECONDS", 60)
+    return monkeypatch
+
+
+def _set_auth(monkeypatch, method):
+    monkeypatch.setattr("src.model_service.auth_manager", SimpleNamespace(auth_method=method))
+
+
+def _service_with(handler):
+    """A ModelService whose HTTP client is served by `handler(request)`."""
+    service = ModelService()
+    service._http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    return service
+
+
+def _recording_handler(responses):
+    """Serve `responses` in order and record each request."""
+    requests = []
+    queue = list(responses)
+
+    def handler(request):
+        requests.append(request)
+        item = queue.pop(0) if len(queue) > 1 else queue[0]
+        if isinstance(item, Exception):
+            raise item
+        status, body = item
+        return httpx.Response(status, json=body)
+
+    return handler, requests
+
+
+class TestDiscoveryCredentials:
+    def test_api_key_auth_uses_x_api_key(self, env):
+        _set_auth(env, "anthropic")
+        env.setenv("ANTHROPIC_API_KEY", "sk-ant-api-test")
+
+        name, headers = ModelService().discovery_credentials()
+
+        assert name == "api_key"
+        assert headers == {"x-api-key": "sk-ant-api-test"}
+
+    def test_cli_auth_uses_oauth_token_as_bearer(self, env):
+        _set_auth(env, "claude_cli")
+        env.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-test")
+
+        name, headers = ModelService().discovery_credentials()
+
+        assert name == "oauth_token"
+        assert headers["authorization"] == "Bearer sk-ant-oat01-test"
+        assert headers["anthropic-beta"] == OAUTH_BETA_HEADER
+        assert "x-api-key" not in headers
+
+    def test_cli_auth_prefers_oauth_token_over_api_key(self, env):
+        _set_auth(env, "claude_cli")
+        env.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-test")
+        env.setenv("ANTHROPIC_API_KEY", "sk-ant-api-test")
+
+        name, _ = ModelService().discovery_credentials()
+
+        assert name == "oauth_token"
+
+    def test_cli_auth_falls_back_to_api_key(self, env):
+        _set_auth(env, "claude_cli")
+        env.setenv("ANTHROPIC_API_KEY", "sk-ant-api-test")
+
+        name, _ = ModelService().discovery_credentials()
+
+        assert name == "api_key"
+
+    def test_api_key_auth_ignores_oauth_token(self, env):
+        _set_auth(env, "anthropic")
+        env.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-test")
+
+        assert ModelService().discovery_credentials() is None
+
+    def test_cli_auth_without_credentials(self, env):
+        _set_auth(env, "claude_cli")
+
+        assert ModelService().discovery_credentials() is None
+
+    @pytest.mark.parametrize("method", ["bedrock", "vertex", "unknown_method"])
+    def test_other_auth_methods_never_discover(self, env, method):
+        _set_auth(env, method)
+        env.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-test")
+        env.setenv("ANTHROPIC_API_KEY", "sk-ant-api-test")
+
+        assert ModelService().discovery_credentials() is None
+
+
+class TestFetchModels:
+    @pytest.mark.asyncio
+    async def test_oauth_request_headers(self, env):
+        _set_auth(env, "claude_cli")
+        env.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-test")
+        handler, requests = _recording_handler([(200, _page("claude-a"))])
+        service = _service_with(handler)
+
+        result = await service.fetch_models_from_api()
+
+        assert [m["id"] for m in result] == ["claude-a"]
+        req = requests[0]
+        assert str(req.url).startswith(MODELS_URL)
+        assert req.headers["authorization"] == "Bearer sk-ant-oat01-test"
+        assert req.headers["anthropic-beta"] == OAUTH_BETA_HEADER
+        assert req.headers["anthropic-version"] == constants.ANTHROPIC_VERSION
+        assert "x-api-key" not in req.headers
+        assert service._credential == "oauth_token"
 
     @pytest.mark.asyncio
-    async def test_fetch_models_success(self, model_service):
-        """Successfully fetches models from API with anthropic auth."""
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {
+    async def test_extra_beta_header_is_merged(self, env):
+        _set_auth(env, "claude_cli")
+        env.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-test")
+        env.setenv("ANTHROPIC_BETA", "some-beta-2026")
+        handler, requests = _recording_handler([(200, _page("claude-a"))])
+
+        await _service_with(handler).fetch_models_from_api()
+
+        assert requests[0].headers["anthropic-beta"] == f"{OAUTH_BETA_HEADER},some-beta-2026"
+
+    @pytest.mark.asyncio
+    async def test_api_key_request_headers(self, env):
+        _set_auth(env, "anthropic")
+        env.setenv("ANTHROPIC_API_KEY", "sk-ant-api-test")
+        handler, requests = _recording_handler([(200, _page("claude-a"))])
+
+        await _service_with(handler).fetch_models_from_api()
+
+        assert requests[0].headers["x-api-key"] == "sk-ant-api-test"
+        assert "authorization" not in requests[0].headers
+
+    @pytest.mark.asyncio
+    async def test_follows_pagination(self, env):
+        _set_auth(env, "anthropic")
+        env.setenv("ANTHROPIC_API_KEY", "sk-ant-api-test")
+        handler, requests = _recording_handler(
+            [(200, _page("claude-a", "claude-b", has_more=True)), (200, _page("claude-c"))]
+        )
+
+        result = await _service_with(handler).fetch_models_from_api()
+
+        assert [m["id"] for m in result] == ["claude-a", "claude-b", "claude-c"]
+        assert len(requests) == 2
+        assert requests[1].url.params["after_id"] == "claude-b"
+
+    @pytest.mark.asyncio
+    async def test_preserves_metadata(self, env):
+        _set_auth(env, "anthropic")
+        env.setenv("ANTHROPIC_API_KEY", "sk-ant-api-test")
+        body = {
             "data": [
-                {"id": "claude-sonnet-4-5-20250929", "name": "Claude Sonnet"},
-                {"id": "claude-haiku-4-5-20251001", "name": "Claude Haiku"},
-            ]
+                {
+                    **_model("claude-a"),
+                    "max_input_tokens": 1_000_000,
+                    "capabilities": {"batch": {"supported": True}},
+                }
+            ],
+            "has_more": False,
         }
+        handler, _ = _recording_handler([(200, body)])
 
-        with patch("src.model_service.auth_manager") as mock_auth:
-            mock_auth.auth_method = "anthropic"
-            with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
-                with patch.object(model_service, "_http_client") as mock_client:
-                    mock_client.get = AsyncMock(return_value=mock_response)
+        [model] = await _service_with(handler).fetch_models_from_api()
 
-                    result = await model_service.fetch_models_from_api()
-
-        assert result is not None
-        assert len(result) == 2
-        assert "claude-sonnet-4-5-20250929" in result
-        assert "claude-haiku-4-5-20251001" in result
+        assert model["object"] == "model"
+        assert model["max_input_tokens"] == 1_000_000
+        assert model["capabilities"] == {"batch": {"supported": True}}
 
     @pytest.mark.asyncio
-    async def test_fetch_models_timeout(self, model_service):
-        """Returns None on timeout, allowing fallback to constants."""
-        with patch("src.model_service.auth_manager") as mock_auth:
-            mock_auth.auth_method = "anthropic"
-            with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
-                with patch.object(model_service, "_http_client") as mock_client:
-                    mock_client.get = AsyncMock(side_effect=httpx.TimeoutException("timeout"))
+    async def test_no_credentials_makes_no_request(self, env):
+        _set_auth(env, "claude_cli")
+        handler, requests = _recording_handler([(200, _page("claude-a"))])
 
-                    result = await model_service.fetch_models_from_api()
+        assert await _service_with(handler).fetch_models_from_api() is None
+        assert requests == []
+
+    @pytest.mark.asyncio
+    async def test_oauth_401_names_the_token(self, env, caplog):
+        _set_auth(env, "claude_cli")
+        env.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-expired")
+        handler, _ = _recording_handler([(401, {"type": "error"})])
+
+        with caplog.at_level("WARNING", logger="src.model_service"):
+            result = await _service_with(handler).fetch_models_from_api()
 
         assert result is None
+        assert any("CLAUDE_CODE_OAUTH_TOKEN" in r.message for r in caplog.records)
 
     @pytest.mark.asyncio
-    async def test_fetch_models_auth_error(self, model_service):
-        """Returns None on 401 auth error, allowing fallback."""
-        mock_response = MagicMock()
-        mock_response.status_code = 401
+    @pytest.mark.parametrize(
+        "response",
+        [
+            (429, {"type": "error"}),
+            (500, {"type": "error"}),
+            (200, {"data": []}),
+            httpx.TimeoutException("timeout"),
+            httpx.ConnectError("connection failed"),
+        ],
+    )
+    async def test_failures_return_none(self, env, response):
+        _set_auth(env, "anthropic")
+        env.setenv("ANTHROPIC_API_KEY", "sk-ant-api-test")
+        handler, _ = _recording_handler([response])
 
-        with patch("src.model_service.auth_manager") as mock_auth:
-            mock_auth.auth_method = "anthropic"
-            with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "invalid-key"}):
-                with patch.object(model_service, "_http_client") as mock_client:
-                    mock_client.get = AsyncMock(return_value=mock_response)
+        assert await _service_with(handler).fetch_models_from_api() is None
 
-                    result = await model_service.fetch_models_from_api()
 
-        assert result is None
+class TestCache:
+    @pytest.mark.asyncio
+    async def test_success_is_cached_for_full_ttl(self, env):
+        _set_auth(env, "claude_cli")
+        env.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-test")
+        handler, requests = _recording_handler([(200, _page("claude-a"))])
+        service = _service_with(handler)
+
+        first = await service.get_available_models()
+        second = await service.get_available_models()
+
+        assert [m["id"] for m in first] == [m["id"] for m in second] == ["claude-a"]
+        assert len(requests) == 1
+        assert service._expires_at - time.time() > 3000
+        assert service._source == "api"
 
     @pytest.mark.asyncio
-    async def test_fetch_models_rate_limited(self, model_service):
-        """Returns None on 429 rate limit, allowing fallback."""
-        mock_response = MagicMock()
-        mock_response.status_code = 429
+    async def test_failure_without_live_list_serves_static_with_short_ttl(self, env):
+        _set_auth(env, "anthropic")
+        env.setenv("ANTHROPIC_API_KEY", "sk-ant-api-test")
+        handler, _ = _recording_handler([(500, {})])
+        service = _service_with(handler)
 
-        with patch("src.model_service.auth_manager") as mock_auth:
-            mock_auth.auth_method = "anthropic"
-            with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
-                with patch.object(model_service, "_http_client") as mock_client:
-                    mock_client.get = AsyncMock(return_value=mock_response)
+        models = await service.get_available_models()
 
-                    result = await model_service.fetch_models_from_api()
-
-        assert result is None
+        assert [m["id"] for m in models] == list(constants.CLAUDE_MODELS)
+        assert service._expires_at - time.time() < 120
+        assert service._source == "fallback"
 
     @pytest.mark.asyncio
-    async def test_fetch_models_network_error(self, model_service):
-        """Returns None on network error, allowing fallback."""
-        with patch("src.model_service.auth_manager") as mock_auth:
-            mock_auth.auth_method = "anthropic"
-            with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
-                with patch.object(model_service, "_http_client") as mock_client:
-                    mock_client.get = AsyncMock(side_effect=httpx.RequestError("connection failed"))
+    async def test_failure_keeps_stale_live_list(self, env):
+        _set_auth(env, "anthropic")
+        env.setenv("ANTHROPIC_API_KEY", "sk-ant-api-test")
+        handler, _ = _recording_handler([(200, _page("claude-a")), (500, {})])
+        service = _service_with(handler)
 
-                    result = await model_service.fetch_models_from_api()
+        await service.get_available_models()
+        service._expires_at = 0  # force expiry
+        models = await service.get_available_models()
 
-        assert result is None
-
-    @pytest.mark.asyncio
-    async def test_fetch_models_no_api_key(self, model_service):
-        """Returns None when no API key is set (anthropic auth)."""
-        with patch("src.model_service.auth_manager") as mock_auth:
-            mock_auth.auth_method = "anthropic"
-            with patch.dict("os.environ", {}, clear=True):
-                # Ensure ANTHROPIC_API_KEY is not set
-                import os
-
-                if "ANTHROPIC_API_KEY" in os.environ:
-                    del os.environ["ANTHROPIC_API_KEY"]
-
-                result = await model_service.fetch_models_from_api()
-
-        assert result is None
+        assert [m["id"] for m in models] == ["claude-a"]
+        assert service._source == "api"
+        assert service._expires_at - time.time() < 120
 
     @pytest.mark.asyncio
-    async def test_fetch_models_empty_response(self, model_service):
-        """Returns None when API returns empty model list."""
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {"data": []}
+    async def test_concurrent_calls_only_fetch_once(self, env):
+        _set_auth(env, "anthropic")
+        env.setenv("ANTHROPIC_API_KEY", "sk-ant-api-test")
+        service = ModelService()
+        calls = 0
 
-        with patch("src.model_service.auth_manager") as mock_auth:
-            mock_auth.auth_method = "anthropic"
-            with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
-                with patch.object(model_service, "_http_client") as mock_client:
-                    mock_client.get = AsyncMock(return_value=mock_response)
+        async def fake_fetch():
+            nonlocal calls
+            calls += 1
+            await asyncio.sleep(0.01)
+            return [{"id": "claude-a", "object": "model", "owned_by": "anthropic"}]
 
-                    result = await model_service.fetch_models_from_api()
+        service.fetch_models_from_api = fake_fetch
 
-        assert result is None
+        results = await asyncio.gather(*[service.get_available_models() for _ in range(8)])
 
-    def test_get_models_returns_cached(self, model_service):
-        """Returns cached models when available."""
-        model_service._cached_models = ["model-a", "model-b", "model-c"]
-
-        result = model_service.get_models()
-
-        assert result == ["model-a", "model-b", "model-c"]
-
-    def test_get_models_returns_fallback(self, model_service):
-        """Returns CLAUDE_MODELS fallback when no cached models."""
-        model_service._cached_models = None
-
-        result = model_service.get_models()
-
-        assert result == list(CLAUDE_MODELS)
-
-    def test_get_models_returns_fallback_empty_cache(self, model_service):
-        """Returns CLAUDE_MODELS fallback when cache is empty list."""
-        # Empty list is falsy, so should fall back
-        model_service._cached_models = []
-
-        result = model_service.get_models()
-
-        # Empty list is falsy, so fallback is used
-        assert result == list(CLAUDE_MODELS)
-
-    def test_is_initialized_false_by_default(self, model_service):
-        """Service is not initialized by default."""
-        assert model_service.is_initialized() is False
+        assert calls == 1
+        assert all(r[0]["id"] == "claude-a" for r in results)
 
     @pytest.mark.asyncio
-    async def test_initialize_sets_initialized(self, model_service):
-        """Initialize sets initialized flag."""
-        with patch.object(model_service, "fetch_models_from_api", new_callable=AsyncMock) as mock:
-            mock.return_value = None
+    async def test_override_skips_live_fetch(self, env):
+        _set_auth(env, "claude_cli")
+        env.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-test")
+        env.setenv("CLAUDE_MODELS_OVERRIDE", "custom-a,custom-b")
+        env.setattr(constants, "CLAUDE_MODELS", ["custom-a", "custom-b"])
+        handler, requests = _recording_handler([(200, _page("claude-a"))])
+        service = _service_with(handler)
 
-            await model_service.initialize()
+        models = await service.get_available_models()
 
-        assert model_service.is_initialized() is True
-
-    @pytest.mark.asyncio
-    async def test_initialize_caches_fetched_models(self, model_service):
-        """Initialize caches successfully fetched models."""
-        fetched = ["claude-3-opus", "claude-3-sonnet"]
-
-        with patch.object(model_service, "fetch_models_from_api", new_callable=AsyncMock) as mock:
-            mock.return_value = fetched
-
-            await model_service.initialize()
-
-        assert model_service._cached_models == fetched
+        assert [m["id"] for m in models] == ["custom-a", "custom-b"]
+        assert service.get_models() == ["custom-a", "custom-b"]
+        assert service.get_status()["source"] == "override"
+        assert requests == []
 
     @pytest.mark.asyncio
-    async def test_initialize_only_once(self, model_service):
-        """Initialize only fetches models once."""
-        with patch.object(model_service, "fetch_models_from_api", new_callable=AsyncMock) as mock:
-            mock.return_value = ["model-1"]
+    async def test_get_models_returns_live_ids(self, env):
+        _set_auth(env, "claude_cli")
+        env.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-test")
+        handler, _ = _recording_handler([(200, _page("claude-a", "claude-b"))])
+        service = _service_with(handler)
 
-            await model_service.initialize()
-            await model_service.initialize()  # Second call should be no-op
+        assert service.get_models() == list(constants.CLAUDE_MODELS)
+        await service.get_available_models()
+        assert service.get_models() == ["claude-a", "claude-b"]
 
-        mock.assert_called_once()
+
+class TestLifecycle:
+    @pytest.mark.asyncio
+    async def test_initialize_populates_cache_and_status(self, env):
+        _set_auth(env, "claude_cli")
+        env.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-test")
+        handler, _ = _recording_handler([(200, _page("claude-a"))])
+        service = _service_with(handler)
+
+        await service.initialize()
+        status = service.get_status()
+
+        assert service.is_initialized()
+        assert status["source"] == "api"
+        assert status["credential"] == "oauth_token"
+        assert status["auth_method"] == "claude_cli"
+        assert status["model_count"] == 1
+        assert status["last_refresh"] is not None
 
     @pytest.mark.asyncio
-    async def test_shutdown_closes_client(self, model_service):
-        """Shutdown closes the HTTP client."""
-        mock_client = AsyncMock()
-        model_service._http_client = mock_client
-        model_service._initialized = True
+    async def test_initialize_only_once(self, env):
+        _set_auth(env, "anthropic")
+        env.setenv("ANTHROPIC_API_KEY", "sk-ant-api-test")
+        handler, requests = _recording_handler([(200, _page("claude-a"))])
+        service = _service_with(handler)
 
-        await model_service.shutdown()
+        await service.initialize()
+        service._expires_at = 0
+        await service.initialize()
 
-        mock_client.aclose.assert_called_once()
-        assert model_service._http_client is None
-        assert model_service._initialized is False
-
-    @pytest.mark.asyncio
-    async def test_shutdown_safe_when_not_initialized(self, model_service):
-        """Shutdown is safe when called before initialization."""
-        # Should not raise
-        await model_service.shutdown()
-
-        assert model_service._http_client is None
-
-
-class TestModelServiceIntegration:
-    """Integration-style tests for ModelService."""
+        assert len(requests) == 1
 
     @pytest.mark.asyncio
-    async def test_full_lifecycle(self):
-        """Test full initialize-use-shutdown lifecycle."""
+    async def test_initialize_without_credentials_uses_fallback(self, env):
+        _set_auth(env, "claude_cli")
         service = ModelService()
 
-        # Mock the API call
-        with patch.object(service, "fetch_models_from_api", new_callable=AsyncMock) as mock:
-            mock.return_value = ["test-model-1", "test-model-2"]
+        await service.initialize()
+        status = service.get_status()
 
-            # Initialize
-            await service.initialize()
-            assert service.is_initialized()
-
-            # Use
-            models = service.get_models()
-            assert models == ["test-model-1", "test-model-2"]
-
-            # Shutdown
-            await service.shutdown()
-            assert not service.is_initialized()
-
-            # After shutdown, should return fallback
-            models = service.get_models()
-            assert models == list(CLAUDE_MODELS)
+        assert status["source"] == "fallback"
+        assert status["credential"] is None
+        assert service.get_models() == list(constants.CLAUDE_MODELS)
+        await service.shutdown()
 
     @pytest.mark.asyncio
-    async def test_fallback_on_api_failure(self):
-        """Test that API failure results in fallback models."""
+    async def test_shutdown_resets_state(self, env):
+        _set_auth(env, "anthropic")
+        env.setenv("ANTHROPIC_API_KEY", "sk-ant-api-test")
+        handler, _ = _recording_handler([(200, _page("claude-a"))])
+        service = _service_with(handler)
+        await service.initialize()
+
+        await service.shutdown()
+
+        assert not service.is_initialized()
+        assert service._http_client is None
+        assert service.get_models() == list(constants.CLAUDE_MODELS)
+        assert service.get_status()["source"] == "fallback"
+        assert service.get_status()["last_refresh"] is None
+
+    @pytest.mark.asyncio
+    async def test_shutdown_safe_when_not_initialized(self):
         service = ModelService()
-
-        # Mock API failure
-        with patch.object(service, "fetch_models_from_api", new_callable=AsyncMock) as mock:
-            mock.return_value = None  # API failed
-
-            await service.initialize()
-
-            models = service.get_models()
-            assert models == list(CLAUDE_MODELS)
-
-            await service.shutdown()
+        await service.shutdown()
+        assert service._http_client is None
 
 
-class TestModelServiceRefresh:
-    """Tests for model refresh functionality."""
-
-    @pytest.fixture
-    def model_service(self):
-        """Create a fresh ModelService instance for each test."""
-        return ModelService()
-
+class TestRefresh:
     @pytest.mark.asyncio
-    async def test_refresh_models_success(self, model_service):
-        """Refresh successfully updates cached models with anthropic auth."""
-        # First, initialize with some models
-        model_service._cached_models = ["old-model-1", "old-model-2"]
-        model_service._source = "api"
-        model_service._initialized = True
+    async def test_refresh_ignores_fresh_cache(self, env):
+        _set_auth(env, "claude_cli")
+        env.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-test")
+        handler, requests = _recording_handler(
+            [(200, _page("claude-a")), (200, _page("claude-a", "claude-new"))]
+        )
+        service = _service_with(handler)
+        await service.get_available_models()
 
-        new_models = ["new-model-1", "new-model-2", "new-model-3"]
+        result = await service.refresh_models()
 
-        with patch("src.model_service.auth_manager") as mock_auth:
-            mock_auth.auth_method = "anthropic"
-            with patch.object(
-                model_service, "fetch_models_from_api", new_callable=AsyncMock
-            ) as mock:
-                mock.return_value = new_models
-
-                result = await model_service.refresh_models()
-
+        assert len(requests) == 2
         assert result["success"] is True
-        assert result["count"] == 3
-        assert result["source"] == "api"
-        assert result["models"] == new_models
-        assert result["auth_method"] == "anthropic"
-        assert model_service._cached_models == new_models
-        assert model_service._source == "api"
-        assert model_service._last_refresh is not None
+        assert result["models"] == ["claude-a", "claude-new"]
+        assert result["credential"] == "oauth_token"
+        assert result["auth_method"] == "claude_cli"
 
     @pytest.mark.asyncio
-    async def test_refresh_models_failure_preserves_existing(self, model_service):
-        """Refresh failure preserves existing cached models."""
-        existing_models = ["existing-model-1", "existing-model-2"]
-        model_service._cached_models = existing_models
-        model_service._source = "api"
-        model_service._initialized = True
+    async def test_refresh_failure_preserves_models(self, env):
+        _set_auth(env, "anthropic")
+        env.setenv("ANTHROPIC_API_KEY", "sk-ant-api-test")
+        handler, _ = _recording_handler([(200, _page("claude-a", "claude-b")), (500, {})])
+        service = _service_with(handler)
+        await service.get_available_models()
+        last_refresh = service._last_refresh
 
-        with patch("src.model_service.auth_manager") as mock_auth:
-            mock_auth.auth_method = "anthropic"
-            with patch.object(
-                model_service, "fetch_models_from_api", new_callable=AsyncMock
-            ) as mock:
-                mock.return_value = None  # API failed
-
-                result = await model_service.refresh_models()
+        result = await service.refresh_models()
 
         assert result["success"] is False
         assert "API fetch failed" in result["message"]
         assert result["current_count"] == 2
         assert result["source"] == "api"
-        assert result["auth_method"] == "anthropic"
-        # Existing models should be preserved
-        assert model_service._cached_models == existing_models
+        assert service.get_models() == ["claude-a", "claude-b"]
+        assert service._last_refresh == last_refresh
 
     @pytest.mark.asyncio
-    async def test_refresh_models_updates_last_refresh_time(self, model_service):
-        """Refresh updates the last_refresh timestamp."""
-        model_service._initialized = True
+    async def test_refresh_cli_without_credentials(self, env):
+        _set_auth(env, "claude_cli")
 
-        before_time = time.time()
-
-        with patch("src.model_service.auth_manager") as mock_auth:
-            mock_auth.auth_method = "anthropic"
-            with patch.object(
-                model_service, "fetch_models_from_api", new_callable=AsyncMock
-            ) as mock:
-                mock.return_value = ["model-1"]
-
-                await model_service.refresh_models()
-
-        after_time = time.time()
-
-        assert model_service._last_refresh is not None
-        assert before_time <= model_service._last_refresh <= after_time
-
-    @pytest.mark.asyncio
-    async def test_refresh_models_failure_does_not_update_timestamp(self, model_service):
-        """Refresh failure does not update last_refresh timestamp."""
-        model_service._cached_models = ["model-1"]
-        model_service._last_refresh = 1000.0  # Some old timestamp
-        model_service._initialized = True
-
-        with patch("src.model_service.auth_manager") as mock_auth:
-            mock_auth.auth_method = "anthropic"
-            with patch.object(
-                model_service, "fetch_models_from_api", new_callable=AsyncMock
-            ) as mock:
-                mock.return_value = None
-
-                await model_service.refresh_models()
-
-        # Timestamp should remain unchanged
-        assert model_service._last_refresh == 1000.0
-
-    def test_get_status_returns_correct_info(self, model_service):
-        """get_status returns correct service status including auth_method."""
-        model_service._initialized = True
-        model_service._source = "api"
-        model_service._cached_models = ["model-1", "model-2", "model-3"]
-        model_service._last_refresh = 1234567890.0
-
-        with patch("src.model_service.auth_manager") as mock_auth:
-            mock_auth.auth_method = "anthropic"
-            status = model_service.get_status()
-
-        assert status["initialized"] is True
-        assert status["source"] == "api"
-        assert status["model_count"] == 3
-        assert status["last_refresh"] == 1234567890.0
-        assert status["auth_method"] == "anthropic"
-
-    def test_get_status_fallback_source(self, model_service):
-        """get_status shows fallback source when not from API."""
-        model_service._initialized = True
-        model_service._source = "fallback"
-        model_service._cached_models = None
-        model_service._last_refresh = None
-
-        with patch("src.model_service.auth_manager") as mock_auth:
-            mock_auth.auth_method = "claude_cli"
-            status = model_service.get_status()
-
-        assert status["initialized"] is True
-        assert status["source"] == "fallback"
-        assert status["model_count"] == len(CLAUDE_MODELS)
-        assert status["last_refresh"] is None
-        assert status["auth_method"] == "claude_cli"
-
-    @pytest.mark.asyncio
-    async def test_initialize_sets_source_api_on_success(self, model_service):
-        """Initialize sets source to 'api' when fetch succeeds."""
-        with patch.object(model_service, "fetch_models_from_api", new_callable=AsyncMock) as mock:
-            mock.return_value = ["model-1", "model-2"]
-
-            await model_service.initialize()
-
-        assert model_service._source == "api"
-        assert model_service._last_refresh is not None
-
-    @pytest.mark.asyncio
-    async def test_initialize_sets_source_fallback_on_failure(self, model_service):
-        """Initialize sets source to 'fallback' when fetch fails."""
-        with patch.object(model_service, "fetch_models_from_api", new_callable=AsyncMock) as mock:
-            mock.return_value = None
-
-            await model_service.initialize()
-
-        assert model_service._source == "fallback"
-        assert model_service._last_refresh is None
-
-    @pytest.mark.asyncio
-    async def test_shutdown_resets_source_and_timestamp(self, model_service):
-        """Shutdown resets source and last_refresh."""
-        model_service._source = "api"
-        model_service._last_refresh = 1234567890.0
-        model_service._initialized = True
-
-        await model_service.shutdown()
-
-        assert model_service._source == "fallback"
-        assert model_service._last_refresh is None
-
-
-class TestModelServiceAuthMethods:
-    """Tests for different authentication method behaviors."""
-
-    @pytest.fixture
-    def model_service(self):
-        """Create a fresh ModelService instance for each test."""
-        return ModelService()
-
-    @pytest.mark.asyncio
-    async def test_fetch_models_cli_auth_returns_none(self, model_service):
-        """CLI auth method returns None (uses static fallback)."""
-        with patch("src.model_service.auth_manager") as mock_auth:
-            mock_auth.auth_method = "claude_cli"
-
-            result = await model_service.fetch_models_from_api()
-
-        assert result is None
-
-    @pytest.mark.asyncio
-    async def test_fetch_models_bedrock_auth_returns_none(self, model_service):
-        """Bedrock auth method returns None (uses static fallback)."""
-        with patch("src.model_service.auth_manager") as mock_auth:
-            mock_auth.auth_method = "bedrock"
-
-            result = await model_service.fetch_models_from_api()
-
-        assert result is None
-
-    @pytest.mark.asyncio
-    async def test_fetch_models_vertex_auth_returns_none(self, model_service):
-        """Vertex auth method returns None (uses static fallback)."""
-        with patch("src.model_service.auth_manager") as mock_auth:
-            mock_auth.auth_method = "vertex"
-
-            result = await model_service.fetch_models_from_api()
-
-        assert result is None
-
-    @pytest.mark.asyncio
-    async def test_fetch_models_unknown_auth_returns_none(self, model_service):
-        """Unknown auth method returns None (uses static fallback)."""
-        with patch("src.model_service.auth_manager") as mock_auth:
-            mock_auth.auth_method = "unknown_method"
-
-            result = await model_service.fetch_models_from_api()
-
-        assert result is None
-
-    @pytest.mark.asyncio
-    async def test_refresh_models_cli_auth_fails(self, model_service):
-        """Refresh with CLI auth returns failure with auth_method in response."""
-        model_service._cached_models = ["model-1"]
-        model_service._source = "fallback"
-        model_service._initialized = True
-
-        with patch("src.model_service.auth_manager") as mock_auth:
-            mock_auth.auth_method = "claude_cli"
-
-            result = await model_service.refresh_models()
+        result = await ModelService().refresh_models()
 
         assert result["success"] is False
-        assert "Dynamic refresh requires ANTHROPIC_API_KEY" in result["message"]
+        assert "CLAUDE_CODE_OAUTH_TOKEN" in result["message"]
         assert result["auth_method"] == "claude_cli"
-        assert result["current_count"] == 1
+        assert result["current_count"] == len(constants.CLAUDE_MODELS)
 
     @pytest.mark.asyncio
-    async def test_refresh_models_bedrock_auth_fails(self, model_service):
-        """Refresh with Bedrock auth returns failure with auth_method in response."""
-        model_service._cached_models = None
-        model_service._source = "fallback"
-        model_service._initialized = True
+    @pytest.mark.parametrize("method", ["bedrock", "vertex"])
+    async def test_refresh_unsupported_auth(self, env, method):
+        _set_auth(env, method)
 
-        with patch("src.model_service.auth_manager") as mock_auth:
-            mock_auth.auth_method = "bedrock"
-
-            result = await model_service.refresh_models()
+        result = await ModelService().refresh_models()
 
         assert result["success"] is False
-        assert "Dynamic refresh requires ANTHROPIC_API_KEY" in result["message"]
-        assert result["auth_method"] == "bedrock"
-        assert result["current_count"] == len(CLAUDE_MODELS)
+        assert f"not supported for auth method: {method}" in result["message"]
+        assert result["auth_method"] == method
 
     @pytest.mark.asyncio
-    async def test_refresh_models_vertex_auth_fails(self, model_service):
-        """Refresh with Vertex auth returns failure with auth_method in response."""
-        model_service._cached_models = None
-        model_service._source = "fallback"
-        model_service._initialized = True
+    async def test_refresh_with_override(self, env):
+        _set_auth(env, "anthropic")
+        env.setenv("ANTHROPIC_API_KEY", "sk-ant-api-test")
+        env.setenv("CLAUDE_MODELS_OVERRIDE", "custom-a")
 
-        with patch("src.model_service.auth_manager") as mock_auth:
-            mock_auth.auth_method = "vertex"
-
-            result = await model_service.refresh_models()
+        result = await ModelService().refresh_models()
 
         assert result["success"] is False
-        assert "Dynamic refresh requires ANTHROPIC_API_KEY" in result["message"]
-        assert result["auth_method"] == "vertex"
-        assert result["current_count"] == len(CLAUDE_MODELS)
-
-    def test_get_status_includes_auth_method_cli(self, model_service):
-        """get_status includes auth_method for CLI auth."""
-        model_service._initialized = True
-        model_service._source = "fallback"
-
-        with patch("src.model_service.auth_manager") as mock_auth:
-            mock_auth.auth_method = "claude_cli"
-            status = model_service.get_status()
-
-        assert status["auth_method"] == "claude_cli"
-
-    def test_get_status_includes_auth_method_bedrock(self, model_service):
-        """get_status includes auth_method for Bedrock auth."""
-        model_service._initialized = True
-        model_service._source = "fallback"
-
-        with patch("src.model_service.auth_manager") as mock_auth:
-            mock_auth.auth_method = "bedrock"
-            status = model_service.get_status()
-
-        assert status["auth_method"] == "bedrock"
-
-    def test_get_status_includes_auth_method_vertex(self, model_service):
-        """get_status includes auth_method for Vertex auth."""
-        model_service._initialized = True
-        model_service._source = "fallback"
-
-        with patch("src.model_service.auth_manager") as mock_auth:
-            mock_auth.auth_method = "vertex"
-            status = model_service.get_status()
-
-        assert status["auth_method"] == "vertex"
+        assert result["source"] == "override"

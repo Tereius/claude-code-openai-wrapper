@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Live model discovery with a claude.ai subscription. Under `cli` auth,
+  `CLAUDE_CODE_OAUTH_TOKEN` is sent to the Anthropic Models API as a Bearer
+  token, so `/v1/models`, `/v1/models/refresh` and the latest-Sonnet default
+  use the subscription's live catalogue instead of the static list. Before,
+  only `ANTHROPIC_API_KEY` enabled discovery. Bedrock and Vertex still use
+  the static list. `/v1/models/status` now reports the `credential` used.
+
+### Changed
+
+- Model discovery has one implementation, in `ModelService`. `/v1/models`
+  and request validation used separate fetchers and caches and could
+  disagree; `/v1/models/status` could report `fallback` while `/v1/models`
+  served live data. Startup now fetches the catalogue once instead of twice.
+  A failed refresh keeps serving the last good live list instead of dropping
+  to the static one.
+
 ### Fixed
 
 - Streamed chat completions arrive as the model writes them. The SDK was

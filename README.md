@@ -7,7 +7,7 @@ OpenAI API-compatible wrapper for Claude Code. Drop it in front of any OpenAI cl
 - OpenAI `/v1/chat/completions` and Anthropic `/v1/messages`, both with streaming.
 - JSON mode (`response_format` with `json_object` or `json_schema`) and function calling (`tools` and `tool_choice`), simulated on top of Claude Code.
 - Sessions: pass a `session_id` to keep a conversation going; list and delete them under `/v1/sessions`.
-- `/v1/models` reads Anthropic's live catalogue when an API key is set and falls back to a built-in list otherwise.
+- `/v1/models` reads Anthropic's live catalogue when an API key or subscription OAuth token is set and falls back to a built-in list otherwise.
 - `/v1/usage` reports each Claude subscription window with its utilization and reset time. A 429 carries a `Retry-After` set to the real reset.
 - Overloaded Opus requests fall back to Sonnet. Repeated upstream failures open a short-lived circuit breaker instead of piling up.
 - Usage is priced per model, and `X-Claude-*` headers set effort, thinking, turns, tools and permission mode per request.
@@ -82,13 +82,13 @@ If `API_KEY` is unset, the server asks at startup whether to generate one. That 
 | `CLAUDE_CWD` | Working directory Claude Code runs in | isolated temp dir |
 | `CLAUDE_AUTH_METHOD` | `cli`, `api_key`, `bedrock`, `vertex` | auto-detect |
 | `API_KEY` | Require this key on every request | interactive prompt |
-| `CLAUDE_CODE_OAUTH_TOKEN` | Subscription OAuth token, read by the bundled Claude CLI. Alternative to `ANTHROPIC_API_KEY` for `cli` auth. | - |
+| `CLAUDE_CODE_OAUTH_TOKEN` | Subscription OAuth token, read by the bundled Claude CLI. Alternative to `ANTHROPIC_API_KEY` for `cli` auth. Also enables live `/v1/models` and the latest-Sonnet default under `cli` auth. | - |
 | `ANTHROPIC_API_KEY` | API key for `api_key` auth. Also enables live `/v1/models` and the latest-Sonnet default. | - |
 | `CLAUDE_CODE_USE_BEDROCK` | Enable AWS Bedrock backend | `false` |
 | `AWS_REGION` / `AWS_DEFAULT_REGION` / `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | Bedrock credentials | - |
 | `CLAUDE_CODE_USE_VERTEX` | Enable Google Vertex AI backend | `false` |
 | `ANTHROPIC_VERTEX_PROJECT_ID` / `CLOUD_ML_REGION` / `GOOGLE_APPLICATION_CREDENTIALS` | Vertex credentials | - |
-| `DEFAULT_MODEL` | Model used when a request names none. Unset: latest Sonnet when `ANTHROPIC_API_KEY` is set, else `claude-sonnet-5-5`. | auto |
+| `DEFAULT_MODEL` | Model used when a request names none. Unset: latest Sonnet when live discovery works (see [Supported models](#supported-models)), else `claude-sonnet-5-5`. | auto |
 | `FAST_MODEL` | Speed and cost optimized model alias | `claude-haiku-5-5` |
 | `CLAUDE_MODELS_OVERRIDE` | Comma-separated model IDs for `/v1/models`. Overrides the live and static lists. | - |
 | `MODEL_LIST_CACHE_TTL_SECONDS` | Cache TTL for live `/v1/models` results | `3600` |
@@ -96,7 +96,7 @@ If `API_KEY` is unset, the server asks at startup whether to generate one. That 
 | `MODEL_LIST_REQUEST_TIMEOUT_SECONDS` | HTTP timeout for the live model fetch | `5` |
 | `ANTHROPIC_MODELS_URL` | Live models endpoint | `https://api.anthropic.com/v1/models` |
 | `ANTHROPIC_VERSION` | `anthropic-version` header sent to the Models API | `2023-06-01` |
-| `ANTHROPIC_BETA` / `ANTHROPIC_BETA_HEADER` | Optional `anthropic-beta` header sent to the Models API | - |
+| `ANTHROPIC_BETA` / `ANTHROPIC_BETA_HEADER` | Optional `anthropic-beta` header sent to the Models API (added to the OAuth beta flag when a subscription token is used) | - |
 | `CLI_AUTH_PROBE_INTERVAL_SECONDS` | Seconds between background CLI auth probes under `cli` auth. Each probe is a real 1-turn query. Only an `auth_failure` result makes requests return 401. `0` disables. | `600` (10 min) |
 | `WRAPPER_QUOTA_ENFORCEMENT_ENABLED` | Refuse requests with 429 while a quota window is `rejected` | `false` |
 | `WRAPPER_QUOTA_PROBE_EVERY_N_REQUESTS` | Requests between quota refresh probes. A probe is a real 1-turn call that spends quota. `0` relies on live traffic alone. | `100` |
@@ -234,7 +234,15 @@ Effort can also go in the request body as `reasoning_effort` (OpenAI's name; `mi
 
 Model IDs, context windows and pricing come from the Anthropic models docs (`platform.claude.com/docs/en/models/overview`, pricing page) and are mirrored in `src/constants.py`.
 
-With `ANTHROPIC_API_KEY` set, `/v1/models` returns Anthropic's live catalogue (cached for `MODEL_LIST_CACHE_TTL_SECONDS`) and the wrapper picks the latest Sonnet as the default at startup. Without it (Bedrock, Vertex or Claude CLI auth), the static list below is served and `claude-sonnet-5-5` is the default. `CLAUDE_MODELS_OVERRIDE=a,b,c` pins the list regardless of auth.
+`/v1/models` returns Anthropic's live catalogue (cached for `MODEL_LIST_CACHE_TTL_SECONDS`) and the wrapper picks the latest Sonnet as the default at startup when it has a credential for the Models API:
+
+| Auth method | Credential used for discovery |
+|---|---|
+| `api_key` | `ANTHROPIC_API_KEY` |
+| `cli` | `CLAUDE_CODE_OAUTH_TOKEN` (the subscription's own catalogue), else `ANTHROPIC_API_KEY` |
+| `bedrock`, `vertex` | none: these platforms use different model IDs |
+
+Without a credential, the static list below is served and `claude-sonnet-5-5` is the default. A `claude login` session stored by the CLI is not read; set `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`) to enable discovery under `cli` auth. If a live fetch fails, the last good live list keeps being served and the fetch is retried after `MODEL_LIST_ERROR_TTL_SECONDS`. `CLAUDE_MODELS_OVERRIDE=a,b,c` pins the list regardless of auth. `/v1/models/status` shows the `source` (`api`, `fallback` or `override`) and which `credential` was used.
 
 ### Latest
 | Model | Context | Max output | Input $/MTok | Output $/MTok |
@@ -292,7 +300,7 @@ Sessions expire after 1 hour of inactivity. See `examples/session_continuity.py`
 | `/v1/messages` | POST | Anthropic-compatible messages |
 | `/v1/models` | GET | List available models |
 | `/v1/models/status` | GET | Model service status |
-| `/v1/models/refresh` | POST | Refresh model catalogue |
+| `/v1/models/refresh` | POST | Refresh the live model catalogue now |
 | `/v1/sessions` | GET | List active sessions |
 | `/v1/sessions/stats` | GET | Session statistics |
 | `/v1/sessions/{id}` | GET | Get session by ID |
