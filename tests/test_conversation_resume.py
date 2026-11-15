@@ -75,6 +75,21 @@ class TestConversationIndex:
         assert index.lookup([_user("Hi"), _assistant("Hello!")]) is None
         assert index.lookup([_user("Hi")]) is None
 
+    def test_log_shows_which_message_the_client_changed(self, caplog):
+        index = ConversationIndex()
+        with caplog.at_level("INFO", logger="src.conversation_index"):
+            index.record([_user("Hi")], _assistant("Hello!"), "cli-1")
+            index.lookup([_user("Hi"), _assistant("Hello, edited!"), _user("x")])
+
+        recorded, missed = [r.getMessage() for r in caplog.records]
+        recorded_parts = recorded.split("[")[1].rstrip("]").split()
+        missed_parts = missed.split("[")[1].rstrip("]").split()
+        assert recorded.startswith("Recorded CLI session cli-1")
+        assert missed.startswith("No CLI session to resume")
+        assert recorded_parts[0] == missed_parts[0]
+        assert recorded_parts[1] != missed_parts[1]
+        assert missed_parts[1].startswith("assistant:") and missed_parts[1].endswith("/14")
+
     def test_disabled_index_never_resumes(self):
         index = ConversationIndex(enabled=False)
         index.record([_user("Hi")], _assistant("Hello!"), "cli-1")

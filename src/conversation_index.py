@@ -64,6 +64,23 @@ def conversation_key(messages: List[Message]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def describe(messages: List[Message]) -> str:
+    """Role, short fingerprint and length of each message, for the log.
+
+    Comparing the line logged when a reply is recorded with the one logged
+    when the next turn finds no session shows which message the client
+    changed in between.
+    """
+    parts = []
+    for m in messages:
+        digest = hashlib.sha256(
+            json.dumps(_message_key(m), sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()[:6]
+        length = len(m.content) if isinstance(m.content, str) else 0
+        parts.append(f"{m.role}:{digest}/{length}")
+    return " ".join(parts)
+
+
 class ConversationIndex:
     """Bounded in-memory map from conversation fingerprint to CLI session id."""
 
@@ -87,17 +104,19 @@ class ConversationIndex:
         if not new_messages or any(m.role not in ("user", "tool") for m in new_messages):
             return None
 
-        key = conversation_key(messages[: last_assistant + 1])
+        history = messages[: last_assistant + 1]
+        key = conversation_key(history)
         with self._lock:
             entry = self._entries.get(key)
-            if entry is None:
-                return None
-            session_id, stored_at = entry
-            if time.monotonic() - stored_at > self.ttl_seconds:
+            if entry is not None and time.monotonic() - entry[1] > self.ttl_seconds:
                 del self._entries[key]
-                return None
-            self._entries.move_to_end(key)
-        return ResumePlan(session_id=session_id, new_messages=new_messages)
+                entry = None
+            if entry is not None:
+                self._entries.move_to_end(key)
+        if entry is None:
+            logger.info(f"No CLI session to resume for [{describe(history)}]")
+            return None
+        return ResumePlan(session_id=entry[0], new_messages=new_messages)
 
     def record(self, messages: List[Message], reply: Message, session_id: Optional[str]) -> None:
         """Remember the session that produced ``reply`` to ``messages``."""
@@ -105,7 +124,9 @@ class ConversationIndex:
             return
         if not reply.content and not reply.tool_calls:
             return
-        key = conversation_key(list(messages) + [reply])
+        conversation = list(messages) + [reply]
+        key = conversation_key(conversation)
+        logger.info(f"Recorded CLI session {session_id} for [{describe(conversation)}]")
         with self._lock:
             self._entries[key] = (session_id, time.monotonic())
             self._entries.move_to_end(key)
